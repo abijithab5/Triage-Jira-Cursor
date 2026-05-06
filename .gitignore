@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.py[cod]
+out/
+.cursor/
+jira_triage/Triage-cursor-DB/repo/
+jira_triage/Triage-cursor-DB/logs/
+jira_triage/Triage-cursor-DB/out/
+jira_triage.zip
+
