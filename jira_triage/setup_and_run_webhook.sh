@@ -4,15 +4,199 @@ set -euo pipefail
 # Hardcode PAT here (leave empty to use env/.env). DO NOT COMMIT real tokens.
 HARDCODED_PAT=""  # Set this only locally, never commit real tokens
 
+# --- Monitoring and Debug Functions ---
+
+_monitor_webhook_logs() {
+  local log_file="${1:-${PROJECT_ROOT}/logs/webhook.log}"
+  if [[ -f "${log_file}" ]]; then
+    echo "Monitoring webhook requests (Ctrl+C to stop): ${log_file}"
+    tail -f "${log_file}" | grep --line-buffered -E "(Request (started|completed|failed)|WEBHOOK)"
+  else
+    echo "Webhook log file not found: ${log_file}"
+    echo "Start the webhook server first, or check WEBHOOK_LOG_FILE setting."
+  fi
+}
+
+_monitor_auth_logs() {
+  local log_file="${1:-${PROJECT_ROOT}/logs/auth.log}"
+  if [[ -f "${log_file}" ]]; then
+    echo "Monitoring authentication attempts (Ctrl+C to stop): ${log_file}"
+    tail -f "${log_file}" | grep --line-buffered -E "(Auth attempt|Probe GET|Preflight|AUTH)"
+  else
+    echo "Auth log file not found: ${log_file}"
+    echo "Start the webhook server first, or check AUTH_LOG_FILE setting."
+  fi
+}
+
+_monitor_all_logs() {
+  local webhook_log="${1:-${PROJECT_ROOT}/logs/webhook.log}"
+  local auth_log="${2:-${PROJECT_ROOT}/logs/auth.log}"
+  local debug_log="${3:-${PROJECT_ROOT}/logs/debug.log}"
+  
+  echo "Monitoring all logs (Ctrl+C to stop)..."
+  echo "  Webhook: ${webhook_log}"
+  echo "  Auth: ${auth_log}"
+  echo "  Debug: ${debug_log}"
+  echo ""
+  
+  # Use multitail if available, otherwise fall back to tail
+  if command -v multitail >/dev/null 2>&1; then
+    multitail -i "${webhook_log}" -i "${auth_log}" -i "${debug_log}" 2>/dev/null || {
+      echo "multitail failed, falling back to tail..."
+      _monitor_fallback_all_logs "${webhook_log}" "${auth_log}" "${debug_log}"
+    }
+  else
+    _monitor_fallback_all_logs "${webhook_log}" "${auth_log}" "${debug_log}"
+  fi
+}
+
+_monitor_fallback_all_logs() {
+  local webhook_log="$1"
+  local auth_log="$2"
+  local debug_log="$3"
+  
+  {
+    [[ -f "${webhook_log}" ]] && tail -f "${webhook_log}" | sed 's/^/[WEBHOOK] /' &
+    [[ -f "${auth_log}" ]] && tail -f "${auth_log}" | sed 's/^/[AUTH] /' &
+    [[ -f "${debug_log}" ]] && tail -f "${debug_log}" | sed 's/^/[DEBUG] /' &
+    wait
+  }
+}
+
+_test_jira_connectivity() {
+  echo "Testing Jira connectivity..."
+  echo "  Base URL: ${jira_base_url}"
+  echo "  SSL verification: $([ "${config_jira_verify_ssl:-true}" = "false" ] && echo "disabled" || echo "enabled")"
+  echo ""
+  
+  # Basic connectivity test
+  if command -v curl >/dev/null 2>&1; then
+    local curl_opts=()
+    if [ "${config_jira_verify_ssl:-true}" = "false" ]; then
+      curl_opts+=(-k)
+    fi
+    
+    echo "Testing basic connectivity (curl)..."
+    if curl "${curl_opts[@]}" -s -f -m 10 "${jira_base_url}/status" >/dev/null 2>&1; then
+      echo "  ✓ Basic connectivity to ${jira_base_url} successful"
+    else
+      echo "  ✗ Cannot reach ${jira_base_url}"
+      echo "  Check network connectivity and base URL"
+    fi
+    
+    echo ""
+    echo "Testing serverInfo endpoint..."
+    local serverinfo_url="${jira_base_url}/rest/api/2/serverInfo"
+    if curl "${curl_opts[@]}" -s -f -m 10 "${serverinfo_url}" >/dev/null 2>&1; then
+      echo "  ✓ ServerInfo endpoint accessible"
+    else
+      echo "  ✗ ServerInfo endpoint failed"
+      echo "  This might indicate network issues or incorrect base URL"
+    fi
+  else
+    echo "curl not available, skipping connectivity test"
+  fi
+}
+
+_show_monitoring_help() {
+  cat <<EOF
+
+=== Monitoring and Debug Commands ===
+
+After starting the webhook server, you can monitor it using:
+
+  # Monitor webhook requests in real-time
+  ${0} monitor-webhook
+
+  # Monitor authentication attempts  
+  ${0} monitor-auth
+
+  # Monitor all logs simultaneously
+  ${0} monitor-all
+
+  # Test Jira connectivity without authentication
+  ${0} test-connectivity
+
+  # Show log file locations
+  ${0} show-logs
+
+Examples:
+  # Start server in background and monitor requests
+  ${0} &
+  sleep 5
+  ${0} monitor-webhook
+
+  # Test connectivity before starting server
+  ${0} test-connectivity
+
+EOF
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# --- Handle monitoring commands early ---
+case "${1:-}" in
+  "monitor-webhook")
+    cd "${PROJECT_ROOT}"
+    _monitor_webhook_logs "${2:-}"
+    exit 0
+    ;;
+  "monitor-auth") 
+    cd "${PROJECT_ROOT}"
+    _monitor_auth_logs "${2:-}"
+    exit 0
+    ;;
+  "monitor-all")
+    cd "${PROJECT_ROOT}"
+    _monitor_all_logs "${2:-}" "${3:-}" "${4:-}"
+    exit 0
+    ;;
+  "test-connectivity")
+    # Need to load config first for this command
+    if [[ -f "${PROJECT_ROOT}/.env" ]]; then
+      set -a
+      source "${PROJECT_ROOT}/.env"
+      set +a
+    fi
+    jira_base_url="${JIRA_BASE_URL:-https://jira.telekom.de}"
+    config_jira_verify_ssl="${JIRA_VERIFY_SSL:-true}"
+    _test_jira_connectivity
+    exit 0
+    ;;
+  "show-logs")
+    echo "Log file locations:"
+    echo "  Webhook: ${PROJECT_ROOT}/logs/webhook.log (or \$WEBHOOK_LOG_FILE)"
+    echo "  Auth: ${PROJECT_ROOT}/logs/auth.log (or \$AUTH_LOG_FILE)"  
+    echo "  Debug: ${PROJECT_ROOT}/logs/debug.log (or \$DEBUG_LOG_PATH)"
+    echo "  App: ${PROJECT_ROOT}/logs/app.log (or \$APP_LOG_FILE)"
+    exit 0
+    ;;
+  "help"|"-h"|"--help")
+    _show_monitoring_help
+    exit 0
+    ;;
+esac
 
 DB_ROOT="${PROJECT_ROOT}/jira_triage/Triage-cursor-DB"
 DEFAULT_REPO_DIR="${DB_ROOT}/repo"
 DEFAULT_LOGS_DIR="${DB_ROOT}/logs"
 DEFAULT_OUT_DIR="${DB_ROOT}/out"
 
+# Create default directories
 mkdir -p "${DEFAULT_REPO_DIR}" "${DEFAULT_LOGS_DIR}" "${DEFAULT_OUT_DIR}"
+
+# Create and verify logs directory for webhook logging
+WEBHOOK_LOGS_DIR="${PROJECT_ROOT}/logs"
+mkdir -p "${WEBHOOK_LOGS_DIR}"
+
+# Test log directory writability
+if ! touch "${WEBHOOK_LOGS_DIR}/.test_write" 2>/dev/null; then
+  echo "ERROR: Cannot write to logs directory: ${WEBHOOK_LOGS_DIR}" >&2
+  echo "Check directory permissions and disk space." >&2
+  exit 2
+fi
+rm -f "${WEBHOOK_LOGS_DIR}/.test_write"
 
 # --- Load .env automatically (same as Python's python-dotenv) ---
 if [[ -f "${PROJECT_ROOT}/.env" ]]; then
@@ -200,8 +384,19 @@ echo "  Cursor analysis:    $([ -n "${CURSOR_API_KEY:-}" ] && echo "enabled (CUR
 echo "  Auto-attach to Jira: ${webhook_auto_attach}"
 echo "  Output dir:         ${output_dir}"
 echo ""
+echo "  Log files:"
+echo "    Webhook requests:   ${PROJECT_ROOT}/logs/webhook.log"
+echo "    Authentication:     ${PROJECT_ROOT}/logs/auth.log"  
+echo "    Debug info:         ${PROJECT_ROOT}/logs/debug.log"
+echo ""
 echo "  Analysis files will appear at:"
 echo "    ${output_dir}/<TICKET-KEY>/cursor_analysis.txt"
+echo ""
+echo "  Real-time monitoring (run in another terminal):"
+echo "    ${0} monitor-webhook    # Monitor webhook requests"
+echo "    ${0} monitor-auth       # Monitor authentication"
+echo "    ${0} monitor-all        # Monitor all logs"
+echo "    ${0} test-connectivity  # Test Jira connectivity"
 echo ""
 echo "Press Ctrl+C to stop the server."
 echo ""
@@ -214,4 +409,10 @@ _on_exit() {
 trap _on_exit EXIT
 
 # --- Start server (exec replaces shell so Ctrl+C goes directly to uvicorn) ---
-exec jira-cursor-webhook --host "${webhook_host}" --port "${webhook_port}"
+# Use module invocation (same pattern as setup_and_run.sh which uses python3 -m jira_triage.cli)
+# Falls back to installed entry point if available.
+if command -v jira-cursor-webhook >/dev/null 2>&1; then
+  exec jira-cursor-webhook --host "${webhook_host}" --port "${webhook_port}"
+else
+  exec python3 -m jira_triage.webhook --host "${webhook_host}" --port "${webhook_port}"
+fi

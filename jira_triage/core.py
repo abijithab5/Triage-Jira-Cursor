@@ -421,7 +421,58 @@ def triage(
     if not out_base.is_absolute():
         out_base = (repo_root / out_base).resolve()
     ticket_dir = (out_base / ticket_key).resolve()
+    
+    # region agent log
+    try:
+        import json as _json
+        import time
+        _log_entry = {
+            "sessionId": "1b4be1",
+            "id": f"log_{int(time.time() * 1000)}_output_dir",
+            "timestamp": int(time.time() * 1000),
+            "location": "jira_triage/core.py:430",
+            "message": "Creating output directory",
+            "data": {
+                "ticket_key": ticket_key,
+                "out_base": str(out_base),
+                "ticket_dir": str(ticket_dir),
+                "ticket_dir_exists_before": ticket_dir.exists()
+            },
+            "runId": "debug",
+            "hypothesisId": "E"
+        }
+        with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps(_log_entry) + "\n")
+    except Exception:
+        pass
+    # endregion
+    
     ticket_dir.mkdir(parents=True, exist_ok=True)
+    
+    # region agent log
+    try:
+        import json as _json
+        import time
+        _log_entry = {
+            "sessionId": "1b4be1",
+            "id": f"log_{int(time.time() * 1000)}_dir_created",
+            "timestamp": int(time.time() * 1000),
+            "location": "jira_triage/core.py:455",
+            "message": "Output directory creation attempted",
+            "data": {
+                "ticket_key": ticket_key,
+                "ticket_dir": str(ticket_dir),
+                "ticket_dir_exists_after": ticket_dir.exists(),
+                "ticket_dir_is_dir": ticket_dir.is_dir() if ticket_dir.exists() else False
+            },
+            "runId": "debug",
+            "hypothesisId": "E"
+        }
+        with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps(_log_entry) + "\n")
+    except Exception:
+        pass
+    # endregion
 
     # 1) Jira fetch (REST primary; MCP fallback)
     issue: dict
@@ -433,6 +484,32 @@ def triage(
 
     if cfg.jira_source in {"auto", "api"}:
         api_attempted = True
+        
+        # region agent log
+        try:
+            import json as _json
+            import time
+            _log_entry = {
+                "sessionId": "1b4be1",
+                "id": f"log_{int(time.time() * 1000)}_jira_auth_start",
+                "timestamp": int(time.time() * 1000),
+                "location": "jira_triage/core.py:460",
+                "message": "Starting Jira API authentication",
+                "data": {
+                    "ticket_key": ticket_key,
+                    "jira_source": cfg.jira_source,
+                    "jira_base_url": cfg.jira_base_url,
+                    "jira_auth_mode": cfg.jira_auth_mode
+                },
+                "runId": "debug",
+                "hypothesisId": "B"
+            }
+            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
+                _f.write(_json.dumps(_log_entry) + "\n")
+        except Exception:
+            pass
+        # endregion
+        
         try:
             api_cfgs: list[Config] = [cfg]
             api_sources: list[str] = []
@@ -525,6 +602,31 @@ def triage(
                 )
                 # endregion
         except (JiraError, TriageError) as e:
+            # region agent log
+            try:
+                import json as _json
+                import time
+                _log_entry = {
+                    "sessionId": "1b4be1",
+                    "id": f"log_{int(time.time() * 1000)}_jira_auth_error",
+                    "timestamp": int(time.time() * 1000),
+                    "location": "jira_triage/core.py:560",
+                    "message": "Jira API authentication/fetch failed",
+                    "data": {
+                        "ticket_key": ticket_key,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)[:500],  # Truncate long errors
+                        "jira_source": cfg.jira_source
+                    },
+                    "runId": "debug",
+                    "hypothesisId": "B"
+                }
+                with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
+                    _f.write(_json.dumps(_log_entry) + "\n")
+            except Exception:
+                pass
+            # endregion
+            
             jira_errors["api"] = str(e)
             (ticket_dir / "jira_api.error.txt").write_text(str(e) + "\n", encoding="utf-8")
             if cfg.jira_source == "api":

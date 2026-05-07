@@ -11,3 +11,6 @@ jira_triage/Triage-cursor-DB/out/
 jira_triage.zip
 node_modules/
 Triage-Jira-Cursor/
+logs/
+*.egg-info/
+venv/
