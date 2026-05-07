@@ -55,6 +55,7 @@ class Config:
     log_api_param_name: str = "ticket"
     log_api_verify_ssl: bool | None = None  # None -> use jira_verify_ssl
     webhook_allow_open: bool = False
+    webhook_auto_attach: bool = False
 
     cursor_api_key: str = ""
     cursor_model_id: str = "composer-2"
@@ -296,6 +297,9 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     webhook_allow_open_raw = _get(env, "WEBHOOK_ALLOW_OPEN", default="false") or "false"
     webhook_allow_open = _parse_bool(webhook_allow_open_raw)
 
+    webhook_auto_attach_raw = _get(env, "WEBHOOK_AUTO_ATTACH", default="false") or "false"
+    webhook_auto_attach = _parse_bool(webhook_auto_attach_raw)
+
     cursor_api_key = (_get(env, "CURSOR_API_KEY", default=None) or "").strip()
     cursor_model_id = (_get(env, "CURSOR_MODEL_ID", default="composer-2") or "composer-2").strip() or "composer-2"
 
@@ -320,6 +324,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         log_api_param_name=log_api_param_name,
         log_api_verify_ssl=log_api_verify_ssl,
         webhook_allow_open=webhook_allow_open,
+        webhook_auto_attach=webhook_auto_attach,
         cursor_api_key=cursor_api_key,
         cursor_model_id=cursor_model_id,
     )

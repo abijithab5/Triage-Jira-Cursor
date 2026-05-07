@@ -1106,8 +1106,10 @@ def triage(
     # endregion
 
     # 9) Optional: zip + attach to Jira
+    # In webhook mode, attach is gated by WEBHOOK_AUTO_ATTACH env var (same pattern as open_cursor).
+    should_attach = attach and (mode == "manual" or cfg.webhook_auto_attach)
     bundle_zip_path: Path | None = None
-    if attach:
+    if should_attach:
         try:
             bundle_zip_path = _write_zip(
                 ticket_dir,

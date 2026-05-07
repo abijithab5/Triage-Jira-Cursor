@@ -107,8 +107,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--process-logs",
         dest="process_logs",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Process logs (clean + summarize). Default: true.",
+        default=False,
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--cursor-analysis",

@@ -51,12 +51,27 @@ def _extract_ticket_key(payload: Any) -> str:
 
 
 @app.post("/jira")
-async def jira_webhook(payload: Any = Body(...), open: bool = Query(default=False), process_logs: bool = Query(default=False)) -> dict[str, str]:
+async def jira_webhook(
+    payload: Any = Body(...),
+    open: bool = Query(default=False),
+    repo: str | None = Query(default=None),
+    logs_dir: str | None = Query(default=None),
+) -> dict[str, Any]:
     try:
         ticket_key = _extract_ticket_key(payload)
         open_requested = open or (isinstance(payload, dict) and _truthy(payload.get("open")))
-        process_logs_requested = process_logs or (isinstance(payload, dict) and _truthy(payload.get("process_logs")))
-        result = triage(ticket_key, mode="webhook", open_cursor=open_requested, process_logs=process_logs_requested)
+        repo_requested = repo or (isinstance(payload, dict) and (payload.get("repo") or None)) or None
+        logs_dir_requested = logs_dir or (isinstance(payload, dict) and (payload.get("logs_dir") or None)) or None
+        result = triage(
+            ticket_key,
+            mode="webhook",
+            open_cursor=open_requested,
+            process_logs=False,
+            cursor_analysis=True,
+            attach=True,
+            repo=repo_requested,
+            logs_dir=logs_dir_requested,
+        )
     except TriageError as e:
         status = 400
         cause = e.__cause__
@@ -72,6 +87,8 @@ async def jira_webhook(payload: Any = Body(...), open: bool = Query(default=Fals
         "output_dir": str(result.output_dir),
         "cursor_context_path": str(result.context_path),
         "bundle_context_path": str(result.bundle_context_path),
+        "cursor_analysis_txt_path": str(result.cursor_analysis_txt_path) if result.cursor_analysis_txt_path else None,
+        "bundle_zip_path": str(result.bundle_zip_path) if result.bundle_zip_path else None,
     }
 
 
