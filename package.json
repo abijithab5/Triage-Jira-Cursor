@@ -1,6 +1,7 @@
 {
   "type": "module",
   "dependencies": {
-    "@cursor/sdk": "latest"
+    "@cursor/sdk": "latest",
+    "fastapi": "^0.0.8"
   }
 }
