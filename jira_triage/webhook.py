@@ -51,11 +51,12 @@ def _extract_ticket_key(payload: Any) -> str:
 
 
 @app.post("/jira")
-async def jira_webhook(payload: Any = Body(...), open: bool = Query(default=False)) -> dict[str, str]:
+async def jira_webhook(payload: Any = Body(...), open: bool = Query(default=False), process_logs: bool = Query(default=False)) -> dict[str, str]:
     try:
         ticket_key = _extract_ticket_key(payload)
         open_requested = open or (isinstance(payload, dict) and _truthy(payload.get("open")))
-        result = triage(ticket_key, mode="webhook", open_cursor=open_requested)
+        process_logs_requested = process_logs or (isinstance(payload, dict) and _truthy(payload.get("process_logs")))
+        result = triage(ticket_key, mode="webhook", open_cursor=open_requested, process_logs=process_logs_requested)
     except TriageError as e:
         status = 400
         cause = e.__cause__

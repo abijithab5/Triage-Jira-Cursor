@@ -11,6 +11,8 @@ from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, Deque
 
+from .debug_log import debug_log
+
 
 class McpError(RuntimeError):
     pass
@@ -35,46 +37,91 @@ def load_cursor_mcp_server(server_name: str, *, cursor_mcp_config_path: Path | N
     This file may contain secrets in the `env` section; callers MUST NOT log them.
     """
     cfg_path = cursor_mcp_config_path or _default_cursor_mcp_config_path()
+    meta: dict[str, Any] = {
+        "cursor_mcp_config_path": str(cfg_path),
+        "server_name": server_name,
+        "outcome": "unknown",
+    }
     try:
-        raw = cfg_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        raise McpError(f"Failed to read Cursor MCP config at {cfg_path}: {e}") from e
+        try:
+            raw = cfg_path.read_text(encoding="utf-8")
+            meta["read_ok"] = True
+        except FileNotFoundError:
+            meta["outcome"] = "config_not_found"
+            return None
+        except Exception as e:
+            meta["outcome"] = "config_read_error"
+            meta["error"] = str(e)
+            raise McpError(f"Failed to read Cursor MCP config at {cfg_path}: {e}") from e
 
-    try:
-        doc = json.loads(raw)
-    except Exception as e:
-        raise McpError(f"Cursor MCP config at {cfg_path} is not valid JSON: {e}") from e
+        try:
+            doc = json.loads(raw)
+            meta["json_ok"] = True
+        except Exception as e:
+            meta["outcome"] = "config_invalid_json"
+            meta["error"] = str(e)
+            raise McpError(f"Cursor MCP config at {cfg_path} is not valid JSON: {e}") from e
 
-    servers = doc.get("mcpServers")
-    if not isinstance(servers, dict):
-        return None
+        servers = doc.get("mcpServers")
+        meta["mcpServers_type"] = type(servers).__name__
+        if not isinstance(servers, dict):
+            meta["outcome"] = "missing_mcpServers"
+            return None
 
-    entry = servers.get(server_name)
-    if not isinstance(entry, dict):
-        return None
+        meta["known_server_count"] = len(servers)
+        meta["known_servers_sample"] = sorted([k for k in servers.keys() if isinstance(k, str)])[:25]
 
-    command = entry.get("command")
-    args = entry.get("args")
-    if not isinstance(command, str) or not command.strip():
-        raise McpError(f"Invalid MCP server config for {server_name!r}: missing command")
-    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-        raise McpError(f"Invalid MCP server config for {server_name!r}: args must be a list[str]")
+        entry = servers.get(server_name)
+        meta["entry_type"] = type(entry).__name__
+        if not isinstance(entry, dict):
+            meta["outcome"] = "server_not_found"
+            return None
 
-    env = entry.get("env")
-    env_dict: dict[str, str] = {}
-    if isinstance(env, dict):
-        for k, v in env.items():
-            if isinstance(k, str) and isinstance(v, str):
-                env_dict[k] = v
+        entry_keys = sorted([k for k in entry.keys() if isinstance(k, str)])
+        meta["entry_keys"] = entry_keys
+        meta["containerish_keys"] = [
+            k for k in entry_keys if "container" in k.lower() or k.lower() in {"image", "runtime"}
+        ]
+        raw_env = entry.get("env")
+        meta["env_type"] = type(raw_env).__name__
+        meta["env_key_count"] = len(raw_env) if isinstance(raw_env, dict) else 0
+        meta["command_type"] = type(entry.get("command")).__name__
+        meta["args_type"] = type(entry.get("args")).__name__
+        meta["timeout_type"] = type(entry.get("timeout")).__name__
 
-    timeout_raw = entry.get("timeout")
-    timeout_seconds = 60.0
-    if isinstance(timeout_raw, (int, float)) and timeout_raw > 0:
-        timeout_seconds = float(timeout_raw)
+        command = entry.get("command")
+        args = entry.get("args")
+        if not isinstance(command, str) or not command.strip():
+            meta["outcome"] = "invalid_missing_command"
+            raise McpError(f"Invalid MCP server config for {server_name!r}: missing command")
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            meta["outcome"] = "invalid_args_type"
+            raise McpError(f"Invalid MCP server config for {server_name!r}: args must be a list[str]")
 
-    return McpServerConfig(command=command, args=list(args), env=env_dict, timeout_seconds=timeout_seconds)
+        env = entry.get("env")
+        env_dict: dict[str, str] = {}
+        if isinstance(env, dict):
+            for k, v in env.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    env_dict[k] = v
+
+        timeout_raw = entry.get("timeout")
+        timeout_seconds = 60.0
+        if isinstance(timeout_raw, (int, float)) and timeout_raw > 0:
+            timeout_seconds = float(timeout_raw)
+
+        meta["outcome"] = "ok"
+        return McpServerConfig(command=command, args=list(args), env=env_dict, timeout_seconds=timeout_seconds)
+    finally:
+        # region agent log (no secrets)
+        debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H7",
+            location="jira_triage/mcp.py:load_cursor_mcp_server",
+            message="load_cursor_mcp_server result (redacted)",
+            data=meta,
+        )
+        # endregion
 
 
 def _now() -> float:

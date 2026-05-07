@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .debug_log import debug_log
 from .jira_client import JiraError
 from .mcp import McpError, StdioMcpClient, load_cursor_mcp_server
 
@@ -64,6 +65,22 @@ def fetch_issue_via_mcp(config: Config, ticket_key: str) -> JiraMcpResult:
                     },
                 },
             )
+
+        # region agent log (no secrets)
+        debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H8",
+            location="jira_triage/jira_mcp.py:fetch_issue_via_mcp",
+            message="MCP jira_get_issue call completed (shape only)",
+            data={
+                "server_name": server_name,
+                "ticket_key": ticket_key,
+                "server_info_keys": sorted(list(server_info.keys())) if isinstance(server_info, dict) else [],
+                "call_result_keys": sorted(list(call_result.keys())) if isinstance(call_result, dict) else [],
+                "call_is_error": bool(call_result.get("isError") is True) if isinstance(call_result, dict) else None,
+            },
+        )
+        # endregion
 
         if call_result.get("isError") is True:
             text = _extract_text_from_calltool_result(call_result)

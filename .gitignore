@@ -5,4 +5,9 @@ __pycache__/
 *.py[cod]
 out/
 .cursor/
-
+jira_triage/Triage-cursor-DB/repo/
+jira_triage/Triage-cursor-DB/logs/
+jira_triage/Triage-cursor-DB/out/
+jira_triage.zip
+node_modules/
+Triage-Jira-Cursor/

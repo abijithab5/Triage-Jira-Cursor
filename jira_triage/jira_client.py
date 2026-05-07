@@ -33,7 +33,10 @@ def _auth_header(config: Config) -> str:
         return f"Bearer {token}"
     user = (config.jira_user or "").strip()
     if not user:
-        raise JiraError("Jira REST basic auth requires JIRA_USER.")
+        raise JiraError(
+            "Jira REST basic auth requires JIRA_USER. If you are using a PAT, use bearer auth "
+            "(set JIRA_AUTH_MODE=bearer or set JIRA_PAT)."
+        )
     return _basic_auth_header(user, token)
 
 
@@ -81,6 +84,7 @@ def _probe_get(config: Config, url: str, *, auth_header: str) -> dict[str, Any]:
                 "x_anodeid": hdrs.get("X-ANODEID"),
                 "has_x_ausername": bool(hdrs.get("X-AUSERNAME")),
                 "content_type": hdrs.get("Content-Type"),
+                "www_authenticate": hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate"),
             }
     except HTTPError as e:
         hdrs = dict(e.headers.items()) if e.headers else {}
@@ -93,6 +97,7 @@ def _probe_get(config: Config, url: str, *, auth_header: str) -> dict[str, Any]:
             "x_anodeid": hdrs.get("X-ANODEID"),
             "has_x_ausername": bool(hdrs.get("X-AUSERNAME")),
             "content_type": hdrs.get("Content-Type"),
+            "www_authenticate": hdrs.get("WWW-Authenticate") or hdrs.get("Www-Authenticate"),
             "final_url": getattr(e, "url", None) or getattr(e, "full_url", None),
         }
     except URLError as e:
@@ -111,19 +116,28 @@ def preflight_myself(config: Config) -> dict[str, Any]:
     myself = _probe_get(config, _api_url(config, config.jira_api_version, "myself"), auth_header=auth_header)
     serverinfo = _probe_get(config, _api_url(config, config.jira_api_version, "serverInfo"), auth_header=auth_header)
 
-    # region agent log
-    debug_log(
-        run_id="pre-fix",
-        hypothesis_id="H6",
-        location="jira_triage/jira_client.py:preflight_myself",
-        message="Preflight results for /myself and /serverInfo (redacted)",
-        data={
-            "api_version": config.jira_api_version,
-            "auth_mode": config.jira_auth_mode,
-            "myself": myself,
-            "serverinfo": serverinfo,
-        },
-    )
+    # region agent log (no secrets)
+    try:
+        scheme = auth_header.split(" ", 1)[0] if isinstance(auth_header, str) and auth_header else None
+        debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H32",
+            location="jira_triage/jira_client.py:preflight_myself",
+            message="Jira REST preflight result (redacted)",
+            data={
+                "jira_base_url": config.jira_base_url,
+                "api_version": config.jira_api_version,
+                "verify_ssl": bool(config.jira_verify_ssl),
+                "timeout_seconds": config.http_timeout_seconds,
+                "auth_mode": config.jira_auth_mode,
+                "auth_scheme": scheme,
+                "token_len": len((config.jira_token or "").strip()),
+                "myself": myself,
+                "serverinfo": serverinfo,
+            },
+        )
+    except Exception:
+        pass
     # endregion
 
     return {"myself": myself, "serverinfo": serverinfo}
@@ -137,23 +151,6 @@ def fetch_issue(config: Config, ticket_key: str) -> dict[str, Any]:
         "Authorization": auth_header,
         "User-Agent": "jira-triage/0.1",
     }
-
-    # region agent log
-    debug_log(
-        run_id="pre-fix",
-        hypothesis_id="H2",
-        location="jira_triage/jira_client.py:fetch_issue",
-        message="About to call Jira issue endpoint",
-        data={
-            "url": url,
-            "ticket_key": ticket_key,
-            "auth_mode": config.jira_auth_mode,
-            "auth_header_prefix": (auth_header.split(" ", 1)[0] if auth_header else ""),
-            "jira_verify_ssl": config.jira_verify_ssl,
-            "timeout_seconds": config.http_timeout_seconds,
-        },
-    )
-    # endregion
 
     req = Request(url, headers=headers, method="GET")
 
@@ -171,58 +168,10 @@ def fetch_issue(config: Config, ticket_key: str) -> dict[str, Any]:
             err_body = b""
         snippet = err_body.decode("utf-8", errors="replace")[:2000]
 
-        # region agent log
-        hdrs = dict(e.headers.items()) if e.headers else {}
-        debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H3",
-            location="jira_triage/jira_client.py:fetch_issue",
-            message="Jira HTTPError",
-            data={
-                "status_code": e.code,
-                "reason": e.reason,
-                "url": url,
-                "final_url": getattr(e, "url", None) or getattr(e, "full_url", None),
-                "auth_mode": config.jira_auth_mode,
-                "x_seraph_loginreason": hdrs.get("X-Seraph-LoginReason"),
-                "x_arequestid": hdrs.get("X-AREQUESTID"),
-                "x_anodeid": hdrs.get("X-ANODEID"),
-                "content_type": hdrs.get("Content-Type"),
-                "content_length": hdrs.get("Content-Length"),
-                "has_x_ausername": bool(hdrs.get("X-AUSERNAME")),
-                "has_set_cookie": "Set-Cookie" in hdrs,
-                "error_body_len": len(err_body),
-            },
-        )
-        # endregion
-
-        if e.code in (401, 403):
-            # region agent log
-            debug_log(
-                run_id="pre-fix",
-                hypothesis_id="H5",
-                location="jira_triage/jira_client.py:fetch_issue",
-                message="Auth/permissions probes after 401/403",
-                data={
-                    "myself_v2": _probe_get(config, _api_url(config, 2, "myself"), auth_header=auth_header),
-                    "serverinfo_v2": _probe_get(config, _api_url(config, 2, "serverInfo"), auth_header=auth_header),
-                },
-            )
-            # endregion
-
         raise JiraError(
             f"Jira request failed ({e.code} {e.reason}) [auth_mode={config.jira_auth_mode}] for {url}: {snippet}"
         ) from e
     except URLError as e:
-        # region agent log
-        debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H4",
-            location="jira_triage/jira_client.py:fetch_issue",
-            message="Jira URLError",
-            data={"url": url, "auth_mode": config.jira_auth_mode, "error": str(e)},
-        )
-        # endregion
         raise JiraError(f"Jira request failed for {url}: {e}") from e
 
     try:

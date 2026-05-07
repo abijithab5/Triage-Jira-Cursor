@@ -31,14 +31,18 @@ def build_context_markdown(
     jira_base_url: str,
     issue: dict[str, Any],
     issue_path: Path,
+    logs_source_ref: str | None = None,
+    logs_copied_dir_name: str | None = None,
     logs_path: Path | None = None,
     logs_cleaned_path: Path | None = None,
     logs_summary_json_path: Path | None = None,
     logs_summary_path: Path | None = None,
+    logs_summary_txt_path: Path | None = None,
     logs_error: str | None = None,
     repo_root: Path | None = None,
     cursor_context_path: Path | None = None,
     analysis_path: Path | None = None,
+    analysis_txt_path: Path | None = None,
     suggested_paths: list[dict[str, Any]] | None = None,
     jira_source_used: str | None = None,
 ) -> str:
@@ -89,6 +93,10 @@ def build_context_markdown(
     lines.append("## Logs")
     lines.append("")
     if logs_path is not None:
+        if logs_source_ref:
+            lines.append(f"- Logs folder (source): {logs_source_ref}")
+        if logs_copied_dir_name:
+            lines.append(f"- Copied logs (bundle): `{logs_copied_dir_name.rstrip('/')}/`")
         lines.append(f"- Raw logs: `{logs_path.name}`")
         if logs_cleaned_path is not None:
             lines.append(f"- Cleaned logs: `{logs_cleaned_path.name}`")
@@ -96,6 +104,8 @@ def build_context_markdown(
             lines.append(f"- Logs summary (JSON): `{logs_summary_json_path.name}`")
         if logs_summary_path is not None:
             lines.append(f"- Logs summary: `{logs_summary_path.name}`")
+        if logs_summary_txt_path is not None:
+            lines.append(f"- Logs summary (TXT): `{logs_summary_txt_path.name}`")
     elif logs_error:
         lines.append(f"- Logs fetch failed: {logs_error}")
     else:
@@ -115,10 +125,11 @@ def build_context_markdown(
                 lines.append(s)
         lines.append("")
 
-    if analysis_path is not None:
+    analysis_fill_path = analysis_txt_path or analysis_path
+    if analysis_fill_path is not None:
         lines.append("## Analysis output")
         lines.append("")
-        lines.append(f"- Fill in: `{analysis_path.name}`")
+        lines.append(f"- Fill in: `{analysis_fill_path.name}`")
         lines.append("")
 
     lines.append("## Bundle files")
@@ -132,8 +143,11 @@ def build_context_markdown(
         lines.append(f"- Logs summary: `{logs_summary_path.name}`")
     if logs_summary_json_path is not None:
         lines.append(f"- Logs summary (JSON): `{logs_summary_json_path.name}`")
-    if analysis_path is not None:
-        lines.append(f"- Analysis: `{analysis_path.name}`")
+    if logs_summary_txt_path is not None:
+        lines.append(f"- Logs summary (TXT): `{logs_summary_txt_path.name}`")
+    analysis_list_path = analysis_txt_path or analysis_path
+    if analysis_list_path is not None:
+        lines.append(f"- Analysis: `{analysis_list_path.name}`")
     lines.append("")
 
     if repo_root is not None and cursor_context_path is not None:
@@ -148,8 +162,32 @@ def build_context_markdown(
 
     lines.append("## Analysis prompt (Cursor)")
     lines.append("")
-    lines.append("Using the ticket details above (and logs if present), produce:")
+    lines.append("Goal: diagnose the issue described in this Jira ticket using the logs and repo context.")
+    lines.append("")
+
+    has_processed = logs_summary_path is not None or logs_summary_json_path is not None
+    if logs_path is not None:
+        if has_processed:
+            summary_name = (
+                logs_summary_txt_path.name
+                if logs_summary_txt_path is not None
+                else (logs_summary_path.name if logs_summary_path is not None else "logs.summary.txt")
+            )
+            lines.append(f"**Step 1 — Read log summary first:** `{summary_name}`")
+            lines.append(f"**Step 2 — Drill into raw logs as needed:** `{logs_path.name}`")
+        else:
+            lines.append(f"**Step 1 — Read the raw logs:** `{logs_path.name}`")
+            if logs_source_ref:
+                lines.append(f"**Step 2 — Browse the full logs folder:** {logs_source_ref}")
+        lines.append("**Step 3 — Search the repo** for relevant code matching error patterns found in the logs.")
+    else:
+        lines.append("**Step 1 — Review the ticket description above** for clues on the failure.")
+        lines.append("**Step 2 — Search the repo** for code related to the issue.")
+
+    lines.append("")
+    lines.append("Produce:")
     lines.append("- A concise summary of the problem and user impact")
+    lines.append("- Evidence from the logs (timestamps, error lines, stack traces)")
     lines.append("- Likely root causes and the most relevant code areas")
     lines.append("- A step-by-step investigation plan")
     lines.append("- Proposed fixes (including tests) and risks/rollout notes")
@@ -167,12 +205,16 @@ def build_cursor_ticket_markdown(
     ticket_dir: Path,
     issue_path: Path,
     jira_source_used: str | None = None,
+    logs_source_ref: str | None = None,
+    logs_copied_dir_name: str | None = None,
     logs_path: Path | None = None,
     logs_cleaned_path: Path | None = None,
     logs_summary_json_path: Path | None = None,
     logs_summary_path: Path | None = None,
+    logs_summary_txt_path: Path | None = None,
     logs_error: str | None = None,
     analysis_path: Path | None = None,
+    analysis_txt_path: Path | None = None,
     suggested_paths: list[dict[str, Any]] | None = None,
 ) -> str:
     """
@@ -204,6 +246,10 @@ def build_cursor_ticket_markdown(
     lines.append("")
     lines.append(f"- Bundle dir: `{_rel(ticket_dir)}`")
     lines.append(f"- Issue JSON: `{_rel(issue_path)}`")
+    if logs_source_ref:
+        lines.append(f"- Logs folder (source): {logs_source_ref}")
+    if logs_copied_dir_name:
+        lines.append(f"- Copied logs (bundle): `{_rel(ticket_dir / logs_copied_dir_name).rstrip('/')}/`")
     if logs_path is not None:
         lines.append(f"- Raw logs: `{_rel(logs_path)}`")
     if logs_cleaned_path is not None:
@@ -212,10 +258,13 @@ def build_cursor_ticket_markdown(
         lines.append(f"- Logs summary (JSON): `{_rel(logs_summary_json_path)}`")
     if logs_summary_path is not None:
         lines.append(f"- Logs summary: `{_rel(logs_summary_path)}`")
+    if logs_summary_txt_path is not None:
+        lines.append(f"- Logs summary (TXT): `{_rel(logs_summary_txt_path)}`")
     if logs_error:
         lines.append(f"- Logs error: {logs_error}")
-    if analysis_path is not None:
-        lines.append(f"- Write analysis here: `{_rel(analysis_path)}`")
+    analysis_write_path = analysis_txt_path or analysis_path
+    if analysis_write_path is not None:
+        lines.append(f"- Write analysis here: `{_rel(analysis_write_path)}`")
     lines.append("")
 
     if suggested_paths:
@@ -232,13 +281,26 @@ def build_cursor_ticket_markdown(
     lines.append("Goal: diagnose and fix the issue described by the Jira ticket, using the attached logs and repo context.")
     lines.append("")
     lines.append("Deliverables:")
-    if analysis_path is not None:
-        lines.append(f"- Update `{_rel(analysis_path)}` with: summary, evidence (log snippets), root cause, fix plan, test plan, rollout notes.")
+    if analysis_write_path is not None:
+        lines.append(
+            f"- Update `{_rel(analysis_write_path)}` with: summary, evidence (log snippets), root cause, fix plan, test plan, rollout notes."
+        )
     else:
         lines.append("- Produce: summary, evidence (log snippets), root cause, fix plan, test plan, rollout notes.")
     lines.append("")
     lines.append("Investigation hints:")
-    lines.append("- Start from the log summary and error samples to identify the failing component and call path.")
+    
+    # Check if we have processed logs or raw logs
+    has_processed_logs = logs_summary_path is not None or logs_summary_json_path is not None
+    if has_processed_logs:
+        lines.append("- Start from the log summary and error samples to identify the failing component and call path.")
+    else:
+        lines.append("- **Raw logs mode**: Analyze logs directly from the source folder or raw log files.")
+        if logs_path is not None:
+            lines.append(f"- Focus on `{_rel(logs_path)}` for error patterns, stack traces, and performance indicators.")
+        if logs_source_ref:
+            lines.append(f"- Browse logs folder: {logs_source_ref}")
+    
     lines.append("- Search for exception class names / endpoints / correlation IDs in the repo.")
     lines.append("- Narrow to the minimal set of files needed for a safe fix + tests.")
     lines.append("")

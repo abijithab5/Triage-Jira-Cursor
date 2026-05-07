@@ -1,6 +1,6 @@
 # Jira-triage (Jira → Cursor)
 
-This starter fetches a Jira issue (MCP-first, REST fallback), optionally fetches related logs (API + local folder fallback), and writes:
+This starter fetches a Jira issue (REST-first when available, MCP fallback), optionally fetches related logs (API + local folder fallback), and writes:
 
 - A bundle to `out/<TICKET_KEY>/`
 - A Cursor context file to `.cursor/context/TICKET.md` in your repo
@@ -8,7 +8,7 @@ This starter fetches a Jira issue (MCP-first, REST fallback), optionally fetches
 ## Setup
 
 ```bash
-cd /Users/abijithp/Desktop/Jira-triage
+cd /path/to/Triage-Jira-Cursor
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -17,12 +17,21 @@ cp .env.example .env
 
 Edit `.env` and set your Jira credentials (do not commit your real token). The tools will load `.env` automatically when present.
 
+## Quickstart (recommended)
+
+```bash
+# Interactive helper that sets env vars and runs the CLI
+bash jira_triage/setup_and_run.sh PROJ-123
+```
+
 Auth options:
 - Bearer PAT: set `JIRA_AUTH_MODE=bearer` and `JIRA_TOKEN=...` (or set `JIRA_PAT=...`)
 - Basic: set `JIRA_AUTH_MODE=basic`, `JIRA_USER=...`, `JIRA_TOKEN=...`
 
+If `JIRA_AUTH_MODE` is unset and a token is present, this project defaults to **bearer** auth (PAT-first). Set `JIRA_AUTH_MODE=basic` to force basic auth.
+
 Jira source:
-- `JIRA_SOURCE=auto` (default): MCP primary, REST fallback
+- `JIRA_SOURCE=auto` (default): REST API primary, MCP fallback
 - `JIRA_SOURCE=mcp`: MCP only
 - `JIRA_SOURCE=api`: REST only
 
@@ -32,7 +41,7 @@ Jira source:
 jira-cursor PROJ-123
 jira-cursor https://jira.telekom.de/browse/PROJ-123
 jira-cursor PROJ-123 --no-open
-jira-cursor PROJ-123 --logs-dir "/path/to/logs"
+jira-cursor PROJ-123 --repo "/path/to/codebase" --logs-dir "/path/to/logs"
 jira-cursor PROJ-123 --attach
 ```
 

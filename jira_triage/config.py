@@ -35,6 +35,9 @@ class Config:
     jira_user: str = ""
     jira_token: str = ""
     jira_auth_mode: str = "basic"  # basic|bearer
+    # Bearer token fallback list (no logging of values). Used to retry 401s safely.
+    jira_bearer_token_candidates: tuple[str, ...] = ()
+    jira_bearer_token_candidate_sources: tuple[str, ...] = ()
     jira_source: str = "auto"  # auto|mcp|api
     jira_mcp_server: str = "mcp-atlassian"
     cursor_mcp_config_path: Path | None = None
@@ -53,8 +56,13 @@ class Config:
     log_api_verify_ssl: bool | None = None  # None -> use jira_verify_ssl
     webhook_allow_open: bool = False
 
+    cursor_api_key: str = ""
+    cursor_model_id: str = "composer-2"
+
 
 def load_config(env: Mapping[str, str] | None = None) -> Config:
+    dotenv_available = False
+    dotenv_loaded: bool | None = None
     if env is None:
         try:
             from dotenv import load_dotenv  # type: ignore
@@ -62,7 +70,11 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
             load_dotenv = None
 
         if load_dotenv is not None:
-            load_dotenv(override=False)
+            dotenv_available = True
+            try:
+                dotenv_loaded = bool(load_dotenv(override=False))
+            except Exception:
+                dotenv_loaded = None
 
         env = os.environ
 
@@ -104,20 +116,69 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     if server_cfg is not None:
         cursor_mcp_env = dict(server_cfg.env or {})
 
-    jira_base_url_raw = _get(env, "JIRA_BASE_URL", required=False, default=None)
-    jira_base_url = (str(jira_base_url_raw).strip() if jira_base_url_raw and str(jira_base_url_raw).strip() else "")
+    jira_base_url_env_raw = _get(env, "JIRA_BASE_URL", required=False, default=None)
+    jira_base_url_env = (
+        str(jira_base_url_env_raw).strip()
+        if jira_base_url_env_raw and str(jira_base_url_env_raw).strip()
+        else ""
+    )
+    jira_base_url = jira_base_url_env
+    jira_base_url_source = "env:JIRA_BASE_URL" if jira_base_url_env else None
     if not jira_base_url:
         jira_base_url = (cursor_mcp_env.get("JIRA_URL") or "").strip()
+        jira_base_url_source = "cursor_mcp_env:JIRA_URL" if jira_base_url else jira_base_url_source
     if not jira_base_url:
         raise ConfigError("Missing required environment variable: JIRA_BASE_URL (or configure JIRA_URL in ~/.cursor/mcp.json)")
 
-    jira_user_raw = (_get(env, "JIRA_USER", default=None) or "").strip() or (cursor_mcp_env.get("JIRA_USERNAME") or "").strip()
-    jira_token_raw = (_get(env, "JIRA_TOKEN", default=None) or "").strip() or (cursor_mcp_env.get("JIRA_API_TOKEN") or "").strip()
-    jira_pat_raw = (_get(env, "JIRA_PAT", default=None) or "").strip() or (cursor_mcp_env.get("JIRA_PERSONAL_TOKEN") or "").strip()
+    jira_user_env = (_get(env, "JIRA_USER", default=None) or "").strip()
+    jira_user_cursor = (cursor_mcp_env.get("JIRA_USERNAME") or "").strip()
+    jira_user_raw = jira_user_env or jira_user_cursor
+    jira_user_source = "env:JIRA_USER" if jira_user_env else ("cursor_mcp_env:JIRA_USERNAME" if jira_user_cursor else None)
+
+    jira_token_env = (_get(env, "JIRA_TOKEN", default=None) or "").strip()
+    jira_token_cursor = (cursor_mcp_env.get("JIRA_API_TOKEN") or "").strip()
+    jira_token_raw = jira_token_env or jira_token_cursor
+    jira_token_source = "env:JIRA_TOKEN" if jira_token_env else ("cursor_mcp_env:JIRA_API_TOKEN" if jira_token_cursor else None)
+
+    jira_pat_env = (_get(env, "JIRA_PAT", default=None) or "").strip()
+    jira_pat_cursor = (cursor_mcp_env.get("JIRA_PERSONAL_TOKEN") or "").strip()
+    jira_pat_raw = jira_pat_env or jira_pat_cursor
+    jira_pat_source = "env:JIRA_PAT" if jira_pat_env else ("cursor_mcp_env:JIRA_PERSONAL_TOKEN" if jira_pat_cursor else None)
+
+    # Bearer token candidates (order matters). Never log token values.
+    bearer_candidates: list[str] = []
+    bearer_sources: list[str] = []
+    def _add_candidate(token: str, source: str | None) -> None:
+        t = (token or "").strip()
+        if not t:
+            return
+        if t in bearer_candidates:
+            return
+        bearer_candidates.append(t)
+        bearer_sources.append(source or "unknown")
+
+    # Prefer explicit env variables first (user intent), then Cursor MCP env.
+    _add_candidate(jira_pat_env, "env:JIRA_PAT" if jira_pat_env else None)
+    _add_candidate(jira_token_env, "env:JIRA_TOKEN" if jira_token_env else None)
+    _add_candidate(jira_token_cursor, "cursor_mcp_env:JIRA_API_TOKEN" if jira_token_cursor else None)
+    _add_candidate(jira_pat_cursor, "cursor_mcp_env:JIRA_PERSONAL_TOKEN" if jira_pat_cursor else None)
 
     jira_auth_mode_raw = _get(env, "JIRA_AUTH_MODE", default=None)
+    auth_mode_inferred_from = "explicit"
     if jira_auth_mode_raw is None or not str(jira_auth_mode_raw).strip():
-        jira_auth_mode = "bearer" if jira_pat_raw else "basic"
+        # Heuristic defaults:
+        # - If a PAT is provided, default to bearer (no username needed).
+        # - If a token is provided, default to bearer as well.
+        #   This matches PAT-first setups; choose basic by setting JIRA_AUTH_MODE=basic explicitly.
+        if jira_pat_raw:
+            jira_auth_mode = "bearer"
+            auth_mode_inferred_from = "jira_pat_present"
+        elif jira_token_raw:
+            jira_auth_mode = "bearer"
+            auth_mode_inferred_from = "jira_token_present"
+        else:
+            jira_auth_mode = "basic"
+            auth_mode_inferred_from = "default_basic_no_token"
     else:
         jira_auth_mode = str(jira_auth_mode_raw).strip().lower()
 
@@ -125,20 +186,58 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         raise ConfigError("JIRA_AUTH_MODE must be 'basic' or 'bearer'")
 
     # region agent log (no secrets)
+    chosen_token_source: str | None = None
+    if jira_auth_mode == "bearer":
+        chosen_token_source = bearer_sources[0] if bearer_sources else (jira_pat_source or jira_token_source)
+    else:
+        chosen_token_source = jira_token_source
+    def _shape(token: str) -> dict[str, object]:
+        t = token or ""
+        return {
+            "len": len(t),
+            "has_internal_ws": any(ch.isspace() for ch in t),
+            "wrapped_in_quotes": (len(t) >= 2 and t[0] == t[-1] and t[0] in {"'", '"'}),
+        }
     debug_log(
         run_id="pre-fix",
         hypothesis_id="H1",
         location="jira_triage/config.py:load_config",
         message="Resolved Jira auth inputs (redacted)",
         data={
+            "dotenv_available": dotenv_available,
+            "dotenv_loaded": dotenv_loaded,
+            "jira_base_url": str(jira_base_url).strip(),
             "jira_base_url_set": bool(str(jira_base_url).strip()),
+            "jira_base_url_source": jira_base_url_source,
             "jira_auth_mode_raw_set": bool(jira_auth_mode_raw and str(jira_auth_mode_raw).strip()),
             "jira_auth_mode": jira_auth_mode,
+            "jira_auth_mode_inferred_from": auth_mode_inferred_from,
             "jira_source": jira_source,
             "cursor_mcp_config_present": bool(server_cfg is not None),
             "jira_mcp_server": jira_mcp_server,
+            "has_jira_user": bool(jira_user_raw),
             "has_jira_token": bool(jira_token_raw),
             "has_jira_pat": bool(jira_pat_raw),
+            "jira_user_source": jira_user_source,
+            "jira_token_source": jira_token_source,
+            "jira_pat_source": jira_pat_source,
+            "jira_chosen_token_source": chosen_token_source,
+            "token_shapes_by_source": {
+                "env:JIRA_PAT": _shape(jira_pat_env),
+                "env:JIRA_TOKEN": _shape(jira_token_env),
+                "cursor_mcp_env:JIRA_API_TOKEN": _shape(jira_token_cursor),
+                "cursor_mcp_env:JIRA_PERSONAL_TOKEN": _shape(jira_pat_cursor),
+            },
+            "bearer_candidate_count": len(bearer_candidates) if jira_auth_mode == "bearer" else 0,
+            "bearer_candidate_sources": bearer_sources if jira_auth_mode == "bearer" else [],
+            "bearer_candidate_shapes": (
+                [
+                    {"idx": i, "source": (bearer_sources[i] if i < len(bearer_sources) else None), "shape": _shape(t)}
+                    for i, t in enumerate(bearer_candidates)
+                ]
+                if jira_auth_mode == "bearer"
+                else []
+            ),
         },
     )
     # endregion
@@ -146,7 +245,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     api_required = jira_source == "api"
 
     if jira_auth_mode == "bearer":
-        jira_token = (jira_pat_raw or jira_token_raw).strip()
+        jira_token = (bearer_candidates[0] if bearer_candidates else (jira_pat_raw or jira_token_raw)).strip()
         if api_required and not jira_token:
             raise ConfigError("Missing required environment variable: JIRA_PAT (or JIRA_TOKEN) for JIRA_SOURCE=api")
         jira_user = jira_user_raw
@@ -197,11 +296,16 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     webhook_allow_open_raw = _get(env, "WEBHOOK_ALLOW_OPEN", default="false") or "false"
     webhook_allow_open = _parse_bool(webhook_allow_open_raw)
 
+    cursor_api_key = (_get(env, "CURSOR_API_KEY", default=None) or "").strip()
+    cursor_model_id = (_get(env, "CURSOR_MODEL_ID", default="composer-2") or "composer-2").strip() or "composer-2"
+
     return Config(
         jira_base_url=str(jira_base_url).strip(),
         jira_user=str(jira_user).strip(),
         jira_token=str(jira_token).strip(),
         jira_auth_mode=jira_auth_mode,
+        jira_bearer_token_candidates=tuple(bearer_candidates) if jira_auth_mode == "bearer" else (),
+        jira_bearer_token_candidate_sources=tuple(bearer_sources) if jira_auth_mode == "bearer" else (),
         jira_source=jira_source,
         jira_mcp_server=jira_mcp_server,
         cursor_mcp_config_path=cursor_mcp_config_path,
@@ -216,5 +320,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         log_api_param_name=log_api_param_name,
         log_api_verify_ssl=log_api_verify_ssl,
         webhook_allow_open=webhook_allow_open,
+        cursor_api_key=cursor_api_key,
+        cursor_model_id=cursor_model_id,
     )
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import gzip
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+from .debug_log import debug_log
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,9 @@ def _looks_like_log_file(p: Path) -> bool:
     if name.startswith("."):
         return False
     if name.endswith((".log", ".txt", ".json", ".jsonl", ".ndjson", ".out", ".err", ".gz")):
+        return True
+    # Rotated logs like *.txt.0 / *.log.1 etc.
+    if re.search(r"\.(log|txt|json|jsonl|ndjson|out|err)\.\d+$", name):
         return True
     # allow extensionless small files
     if "." not in name:
@@ -105,11 +111,24 @@ def collect_local_logs(
         return LocalLogsResult(ok=False, source_dir=source, error=f"No log-like files found under: {source}")
 
     tk = ticket_key.lower()
+    tk_space = tk.replace("-", " ")
     def _priority(p: Path) -> tuple[int, int]:
         n = p.name.lower()
+        full = str(p).lower()
         score = 0
-        if tk in n:
+        if tk in n or tk in full:
             score += 100
+        elif tk_space in full:
+            score += 80
+        # Prefer "system state" logs for incident analysis.
+        if "selfheal" in n:
+            score += 90
+        if "systeminfo" in n or "systeminfolog" in n:
+            score += 40
+        if n == "messages" or "syslog" in n:
+            score += 35
+        if "consolelog" in n or n == "kernel" or "system_eventlog" in n or "eventlog" in n:
+            score += 25
         if "error" in n or "err" in n:
             score += 10
         if "stdout" in n or "stderr" in n:
@@ -123,6 +142,27 @@ def collect_local_logs(
 
     candidates.sort(reverse=True, key=_priority)
     selected = candidates[:max_files]
+
+    # region agent log (no secrets)
+    try:
+        debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H15",
+            location="jira_triage/logs_local.py:collect_local_logs",
+            message="Local logs selection summary",
+            data={
+                "ticket_key": ticket_key,
+                "source_dir": str(source),
+                "candidate_count": len(candidates),
+                "selected_count": len(selected),
+                "selected_names": [p.name for p in selected],
+                "selected_has_selfheal": any("selfheal" in p.name.lower() for p in selected),
+                "selected_has_messages": any(p.name.lower() == "messages" for p in selected),
+            },
+        )
+    except Exception:
+        pass
+    # endregion
 
     dest_dir = (ticket_dir / "logs_local").resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
