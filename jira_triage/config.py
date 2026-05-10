@@ -60,6 +60,31 @@ class Config:
     cursor_api_key: str = ""
     cursor_model_id: str = "composer-2"
 
+    # Polling configuration
+    polling_enabled: bool = False
+    polling_interval_seconds: int = 300  # 5 minutes default
+    polling_jql: str = "assignee = currentUser() ORDER BY updated DESC"
+    polling_max_results: int = 50
+    
+    # Attachment-based duplicate detection
+    jira_check_our_attachments: bool = True
+    jira_attachment_prefix: str = "jira-triage-analysis"
+    processed_tickets_db: str = "data/processed_tickets.db"
+    
+    # Webhook duplicate processing behavior
+    webhook_skip_duplicates: bool = True
+    webhook_force_reprocess: bool = False
+    
+    # Magnus API log downloading
+    magnus_log_api_enabled: bool = False
+    magnus_log_api_base_url: str = "https://cms-cdn.yo-digital.com/hgw/magnus"
+    magnus_log_api_token: str = ""
+    magnus_log_mac_address: str | None = None
+    magnus_log_start_date: str | None = None
+    magnus_log_end_date: str | None = None
+    magnus_auto_merge_logs: bool = True
+    magnus_merge_output_dir: str = "merged"
+
 
 def load_config(env: Mapping[str, str] | None = None) -> Config:
     dotenv_available = False
@@ -303,6 +328,74 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     cursor_api_key = (_get(env, "CURSOR_API_KEY", default=None) or "").strip()
     cursor_model_id = (_get(env, "CURSOR_MODEL_ID", default="composer-2") or "composer-2").strip() or "composer-2"
 
+    # Polling configuration
+    polling_enabled_raw = _get(env, "JIRA_POLLING_ENABLED", default="false") or "false"
+    polling_enabled = _parse_bool(polling_enabled_raw)
+
+    polling_interval_raw = _get(env, "JIRA_POLLING_INTERVAL", default="300") or "300"
+    try:
+        polling_interval_seconds = int(polling_interval_raw)
+        if polling_interval_seconds < 1:
+            raise ValueError("must be positive")
+    except ValueError as e:
+        raise ConfigError(f"Invalid JIRA_POLLING_INTERVAL: {polling_interval_raw!r} (must be positive integer)") from e
+
+    polling_jql = (_get(env, "JIRA_POLLING_JQL", default="assignee = currentUser() ORDER BY updated DESC") or 
+                   "assignee = currentUser() ORDER BY updated DESC").strip()
+    if not polling_jql:
+        raise ConfigError("JIRA_POLLING_JQL must be a non-empty string")
+
+    polling_max_results_raw = _get(env, "JIRA_POLLING_MAX_RESULTS", default="50") or "50"
+    try:
+        polling_max_results = int(polling_max_results_raw)
+        if polling_max_results < 1:
+            raise ValueError("must be positive")
+    except ValueError as e:
+        raise ConfigError(f"Invalid JIRA_POLLING_MAX_RESULTS: {polling_max_results_raw!r} (must be positive integer)") from e
+
+    # Attachment-based duplicate detection configuration
+    jira_check_our_attachments_raw = _get(env, "JIRA_CHECK_OUR_ATTACHMENTS", default="true") or "true"
+    jira_check_our_attachments = _parse_bool(jira_check_our_attachments_raw)
+    
+    jira_attachment_prefix = (_get(env, "JIRA_ATTACHMENT_PREFIX", default="jira-triage-analysis") or 
+                             "jira-triage-analysis").strip()
+    if not jira_attachment_prefix:
+        raise ConfigError("JIRA_ATTACHMENT_PREFIX must be a non-empty string")
+        
+    processed_tickets_db = (_get(env, "PROCESSED_TICKETS_DB", default="data/processed_tickets.db") or 
+                           "data/processed_tickets.db").strip()
+    if not processed_tickets_db:
+        raise ConfigError("PROCESSED_TICKETS_DB must be a non-empty string")
+
+    # Webhook duplicate processing behavior configuration  
+    webhook_skip_duplicates_raw = _get(env, "WEBHOOK_SKIP_DUPLICATES", default="true") or "true"
+    webhook_skip_duplicates = _parse_bool(webhook_skip_duplicates_raw)
+    
+    webhook_force_reprocess_raw = _get(env, "WEBHOOK_FORCE_REPROCESS", default="false") or "false"
+    webhook_force_reprocess = _parse_bool(webhook_force_reprocess_raw)
+
+    # Magnus API log downloading configuration
+    magnus_log_api_enabled_raw = _get(env, "MAGNUS_LOG_API_ENABLED", default="false") or "false"
+    magnus_log_api_enabled = _parse_bool(magnus_log_api_enabled_raw)
+
+    magnus_log_api_base_url = (_get(env, "MAGNUS_LOG_API_BASE_URL", default="https://cms-cdn.yo-digital.com/hgw/magnus") or 
+                               "https://cms-cdn.yo-digital.com/hgw/magnus").strip()
+    if not magnus_log_api_base_url:
+        raise ConfigError("MAGNUS_LOG_API_BASE_URL must be a non-empty string")
+
+    magnus_log_api_token = (_get(env, "MAGNUS_LOG_API_TOKEN", default=None) or "").strip()
+
+    magnus_log_mac_address = (_get(env, "MAGNUS_LOG_MAC", default=None) or "").strip() or None
+
+    magnus_log_start_date = (_get(env, "MAGNUS_LOG_START_DATE", default=None) or "").strip() or None
+
+    magnus_log_end_date = (_get(env, "MAGNUS_LOG_END_DATE", default=None) or "").strip() or None
+
+    magnus_auto_merge_logs_raw = _get(env, "MAGNUS_AUTO_MERGE_LOGS", default="true") or "true"
+    magnus_auto_merge_logs = _parse_bool(magnus_auto_merge_logs_raw)
+    
+    magnus_merge_output_dir = (_get(env, "MAGNUS_MERGE_OUTPUT_DIR", default="merged") or "merged").strip()
+
     return Config(
         jira_base_url=str(jira_base_url).strip(),
         jira_user=str(jira_user).strip(),
@@ -327,5 +420,22 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         webhook_auto_attach=webhook_auto_attach,
         cursor_api_key=cursor_api_key,
         cursor_model_id=cursor_model_id,
+        polling_enabled=polling_enabled,
+        polling_interval_seconds=polling_interval_seconds,
+        polling_jql=polling_jql,
+        polling_max_results=polling_max_results,
+        jira_check_our_attachments=jira_check_our_attachments,
+        jira_attachment_prefix=jira_attachment_prefix,
+        processed_tickets_db=processed_tickets_db,
+        webhook_skip_duplicates=webhook_skip_duplicates,
+        webhook_force_reprocess=webhook_force_reprocess,
+        magnus_log_api_enabled=magnus_log_api_enabled,
+        magnus_log_api_base_url=magnus_log_api_base_url,
+        magnus_log_api_token=magnus_log_api_token,
+        magnus_log_mac_address=magnus_log_mac_address,
+        magnus_log_start_date=magnus_log_start_date,
+        magnus_log_end_date=magnus_log_end_date,
+        magnus_auto_merge_logs=magnus_auto_merge_logs,
+        magnus_merge_output_dir=magnus_merge_output_dir,
     )
 

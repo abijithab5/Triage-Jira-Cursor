@@ -255,6 +255,19 @@ def preflight_myself(config: Config) -> dict[str, Any]:
     return {"myself": myself, "serverinfo": serverinfo}
 
 
+def degraded_preflight_myself_allows_issue_fetch(myself: dict[str, Any]) -> bool:
+    """
+    Some Jira deployments authenticate successfully but forbid GET /myself for certain
+    tokens or roles while still allowing GET /issue/{key}. Detect that case from probe output.
+    """
+    if myself.get("status_code") != 403:
+        return False
+    lr = str(myself.get("x_seraph_loginreason") or "").strip().upper()
+    if lr == "OK":
+        return True
+    return bool(myself.get("has_x_ausername"))
+
+
 def fetch_issue(config: Config, ticket_key: str) -> dict[str, Any]:
     url = issue_endpoint(config, ticket_key)
     auth_logger.info("Fetching issue: ticket=%s url=%s", ticket_key, url)
@@ -319,6 +332,98 @@ def fetch_issue(config: Config, ticket_key: str) -> dict[str, Any]:
                          ticket_key, str(e), snippet[:500])
         raise JiraError(
             f"Jira response was not valid JSON for {url}: {snippet}",
+            error_type="json_decode_error"
+        ) from e
+
+
+def search_endpoint(config: Config, jql: str, max_results: int = 50, fields: str = "key,updated,assignee") -> str:
+    """Build Jira search endpoint URL with JQL query."""
+    query_params = f"jql={quote(jql)}&maxResults={max_results}&fields={quote(fields)}"
+    return _api_url(config, config.jira_api_version, f"search?{query_params}")
+
+
+def search_issues(config: Config, jql: str, max_results: int = 50, fields: str = "key,updated,assignee,attachment") -> list[dict[str, Any]]:
+    """Search for issues using JQL query.
+    
+    Args:
+        config: Jira configuration
+        jql: JQL query string (e.g., "assignee = currentUser() ORDER BY updated DESC")
+        max_results: Maximum number of issues to return (default 50)
+        fields: Comma-separated list of fields to include (default "key,updated,assignee,attachment")
+    
+    Returns:
+        List of issue dictionaries, each containing the requested fields
+        
+    Raises:
+        JiraError: If the search request fails or returns invalid JSON
+    """
+    url = search_endpoint(config, jql, max_results, fields)
+    auth_logger.info("Searching issues: jql=%s max_results=%d url=%s", jql, max_results, url)
+    
+    auth_header = _auth_header(config)
+    headers = {
+        "Accept": "application/json",
+        "Authorization": auth_header,
+        "User-Agent": "jira-triage/0.1",
+    }
+
+    req = Request(url, headers=headers, method="GET")
+
+    try:
+        with urlopen(
+            req,
+            timeout=config.http_timeout_seconds,
+            context=_ssl_context(verify_ssl=config.jira_verify_ssl),
+        ) as resp:
+            body = resp.read()
+            auth_logger.info("Issue search successful: jql=%s response_size=%d", 
+                           jql, len(body))
+    except HTTPError as e:
+        try:
+            err_body = e.read()
+        except Exception:
+            err_body = b""
+        snippet = err_body.decode("utf-8", errors="replace")[:2000]
+        error_type, error_desc = _classify_error(e)
+
+        auth_logger.error(
+            "Issue search HTTP error: jql=%s status=%s error_type=%s auth_mode=%s url=%s snippet=%s",
+            jql, e.code, error_type, config.jira_auth_mode, url, snippet[:500]
+        )
+
+        raise JiraError(
+            f"Jira search failed ({e.code} {e.reason}) [auth_mode={config.jira_auth_mode}] for {url}: {snippet}",
+            error_type=error_type,
+            status_code=e.code
+        ) from e
+    except URLError as e:
+        error_type, error_desc = _classify_error(e)
+        
+        auth_logger.error(
+            "Issue search network error: jql=%s error_type=%s url=%s error=%s",
+            jql, error_type, url, str(e)
+        )
+        
+        raise JiraError(
+            f"Jira search request failed for {url}: {e}",
+            error_type=error_type
+        ) from e
+
+    try:
+        result = json.loads(body.decode("utf-8"))
+        issues = result.get("issues", [])
+        total = result.get("total", len(issues))
+        
+        auth_logger.debug("Issue search JSON parsed successfully: jql=%s issues_returned=%d total_available=%d", 
+                         jql, len(issues), total)
+        
+        return issues
+    except json.JSONDecodeError as e:
+        snippet = body.decode("utf-8", errors="replace")[:2000]
+        auth_logger.error("Issue search JSON decode error: jql=%s error=%s snippet=%s",
+                         jql, str(e), snippet[:500])
+        raise JiraError(
+            f"Jira search response was not valid JSON for {url}: {snippet}",
             error_type="json_decode_error"
         ) from e
 

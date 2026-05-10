@@ -6,28 +6,6 @@ HARDCODED_PAT=""  # Set this only locally, never commit real tokens
 
 # --- Monitoring and Debug Functions ---
 
-_monitor_webhook_logs() {
-  local log_file="${1:-${PROJECT_ROOT}/logs/webhook.log}"
-  if [[ -f "${log_file}" ]]; then
-    echo "Monitoring webhook requests (Ctrl+C to stop): ${log_file}"
-    tail -f "${log_file}" | grep --line-buffered -E "(Request (started|completed|failed)|WEBHOOK)"
-  else
-    echo "Webhook log file not found: ${log_file}"
-    echo "Start the webhook server first, or check WEBHOOK_LOG_FILE setting."
-  fi
-}
-
-_monitor_auth_logs() {
-  local log_file="${1:-${PROJECT_ROOT}/logs/auth.log}"
-  if [[ -f "${log_file}" ]]; then
-    echo "Monitoring authentication attempts (Ctrl+C to stop): ${log_file}"
-    tail -f "${log_file}" | grep --line-buffered -E "(Auth attempt|Probe GET|Preflight|AUTH)"
-  else
-    echo "Auth log file not found: ${log_file}"
-    echo "Start the webhook server first, or check AUTH_LOG_FILE setting."
-  fi
-}
-
 _monitor_polling_logs() {
   local log_file="${1:-${PROJECT_ROOT}/logs/polling.log}"
   if [[ -f "${log_file}" ]]; then
@@ -39,41 +17,48 @@ _monitor_polling_logs() {
   fi
 }
 
+_monitor_auth_logs() {
+  local log_file="${1:-${PROJECT_ROOT}/logs/auth.log}"
+  if [[ -f "${log_file}" ]]; then
+    echo "Monitoring authentication attempts (Ctrl+C to stop): ${log_file}"
+    tail -f "${log_file}" | grep --line-buffered -E "(Auth attempt|Probe GET|Preflight|AUTH)"
+  else
+    echo "Auth log file not found: ${log_file}"
+    echo "Start the polling service first, or check AUTH_LOG_FILE setting."
+  fi
+}
+
 _monitor_all_logs() {
-  local webhook_log="${1:-${PROJECT_ROOT}/logs/webhook.log}"
-  local auth_log="${2:-${PROJECT_ROOT}/logs/auth.log}"
+  local auth_log="${1:-${PROJECT_ROOT}/logs/auth.log}"
+  local polling_log="${2:-${PROJECT_ROOT}/logs/polling.log}"
   local debug_log="${3:-${PROJECT_ROOT}/logs/debug.log}"
-  local polling_log="${4:-${PROJECT_ROOT}/logs/polling.log}"
   
-  echo "Monitoring all logs (Ctrl+C to stop)..."
-  echo "  Webhook: ${webhook_log}"
+  echo "Monitoring all polling logs (Ctrl+C to stop)..."
   echo "  Auth: ${auth_log}"
-  echo "  Debug: ${debug_log}"
   echo "  Polling: ${polling_log}"
+  echo "  Debug: ${debug_log}"
   echo ""
   
   # Use multitail if available, otherwise fall back to tail
   if command -v multitail >/dev/null 2>&1; then
-    multitail -i "${webhook_log}" -i "${auth_log}" -i "${debug_log}" -i "${polling_log}" 2>/dev/null || {
+    multitail -i "${auth_log}" -i "${polling_log}" -i "${debug_log}" 2>/dev/null || {
       echo "multitail failed, falling back to tail..."
-      _monitor_fallback_all_logs "${webhook_log}" "${auth_log}" "${debug_log}" "${polling_log}"
+      _monitor_fallback_all_logs "${auth_log}" "${polling_log}" "${debug_log}"
     }
   else
-    _monitor_fallback_all_logs "${webhook_log}" "${auth_log}" "${debug_log}" "${polling_log}"
+    _monitor_fallback_all_logs "${auth_log}" "${polling_log}" "${debug_log}"
   fi
 }
 
 _monitor_fallback_all_logs() {
-  local webhook_log="$1"
-  local auth_log="$2"
+  local auth_log="$1"
+  local polling_log="$2"
   local debug_log="$3"
-  local polling_log="${4:-}"
   
   {
-    [[ -f "${webhook_log}" ]] && tail -f "${webhook_log}" | sed 's/^/[WEBHOOK] /' &
     [[ -f "${auth_log}" ]] && tail -f "${auth_log}" | sed 's/^/[AUTH] /' &
+    [[ -f "${polling_log}" ]] && tail -f "${polling_log}" | sed 's/^/[POLLING] /' &
     [[ -f "${debug_log}" ]] && tail -f "${debug_log}" | sed 's/^/[DEBUG] /' &
-    [[ -n "${polling_log}" && -f "${polling_log}" ]] && tail -f "${polling_log}" | sed 's/^/[POLLING] /' &
     wait
   }
 }
@@ -113,21 +98,38 @@ _test_jira_connectivity() {
   fi
 }
 
+_test_polling_dry_run() {
+  echo "Testing polling configuration with dry run..."
+  echo "  This will show what tickets would be processed without actually processing them"
+  echo ""
+  
+  if command -v python3 >/dev/null 2>&1; then
+    cd "${PROJECT_ROOT}"
+    if [[ -d "venv" ]]; then
+      echo "Activating virtual environment..."
+      source venv/bin/activate
+    fi
+    
+    echo "Running: jira-cursor poll --once --dry-run"
+    echo ""
+    jira-cursor poll --once --dry-run
+  else
+    echo "Python3 not available for dry run test"
+  fi
+}
+
 _show_monitoring_help() {
   cat <<EOF
 
-=== Monitoring and Debug Commands ===
+=== Jira Polling Monitoring and Debug Commands ===
 
-After starting the webhook server, you can monitor it using:
-
-  # Monitor webhook requests in real-time
-  ${0} monitor-webhook
-
-  # Monitor authentication attempts  
-  ${0} monitor-auth
+After starting the polling service, you can monitor it using:
 
   # Monitor polling service activity
   ${0} monitor-polling
+
+  # Monitor authentication attempts  
+  ${0} monitor-auth
 
   # Monitor all logs simultaneously
   ${0} monitor-all
@@ -135,17 +137,21 @@ After starting the webhook server, you can monitor it using:
   # Test Jira connectivity without authentication
   ${0} test-connectivity
 
+  # Test polling configuration with dry run
+  ${0} test-polling
+
   # Show log file locations
   ${0} show-logs
 
 Examples:
-  # Start server in background and monitor requests
+  # Start polling service in background and monitor activity
   ${0} &
   sleep 5
-  ${0} monitor-webhook
+  ${0} monitor-polling
 
-  # Test connectivity before starting server
+  # Test connectivity and polling before starting service
   ${0} test-connectivity
+  ${0} test-polling
 
 EOF
 }
@@ -155,9 +161,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --- Handle monitoring commands early ---
 case "${1:-}" in
-  "monitor-webhook")
+  "monitor-polling")
     cd "${PROJECT_ROOT}"
-    _monitor_webhook_logs "${2:-}"
+    _monitor_polling_logs "${2:-}"
     exit 0
     ;;
   "monitor-auth") 
@@ -165,14 +171,9 @@ case "${1:-}" in
     _monitor_auth_logs "${2:-}"
     exit 0
     ;;
-  "monitor-polling")
-    cd "${PROJECT_ROOT}"
-    _monitor_polling_logs "${2:-}"
-    exit 0
-    ;;
   "monitor-all")
     cd "${PROJECT_ROOT}"
-    _monitor_all_logs "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    _monitor_all_logs "${2:-}" "${3:-}" "${4:-}"
     exit 0
     ;;
   "test-connectivity")
@@ -187,9 +188,19 @@ case "${1:-}" in
     _test_jira_connectivity
     exit 0
     ;;
+  "test-polling")
+    cd "${PROJECT_ROOT}"
+    # Load .env if available
+    if [[ -f "${PROJECT_ROOT}/.env" ]]; then
+      set -a
+      source "${PROJECT_ROOT}/.env"
+      set +a
+    fi
+    _test_polling_dry_run
+    exit 0
+    ;;
   "show-logs")
     echo "Log file locations:"
-    echo "  Webhook: ${PROJECT_ROOT}/logs/webhook.log (or \$WEBHOOK_LOG_FILE)"
     echo "  Auth: ${PROJECT_ROOT}/logs/auth.log (or \$AUTH_LOG_FILE)"  
     echo "  Polling: ${PROJECT_ROOT}/logs/polling.log (or \$POLLING_LOG_FILE)"
     echo "  Debug: ${PROJECT_ROOT}/logs/debug.log (or \$DEBUG_LOG_PATH)"
@@ -202,25 +213,55 @@ case "${1:-}" in
     ;;
 esac
 
+# --- Setup default directories ---
 DB_ROOT="${PROJECT_ROOT}/jira_triage/Triage-cursor-DB"
 DEFAULT_REPO_DIR="${DB_ROOT}/repo"
 DEFAULT_LOGS_DIR="${DB_ROOT}/logs"
 DEFAULT_OUT_DIR="${DB_ROOT}/out"
+POLLING_LOGS_DIR="${PROJECT_ROOT}/logs"
 
 # Create default directories
 mkdir -p "${DEFAULT_REPO_DIR}" "${DEFAULT_LOGS_DIR}" "${DEFAULT_OUT_DIR}"
 
-# Create and verify logs directory for webhook logging
-WEBHOOK_LOGS_DIR="${PROJECT_ROOT}/logs"
-mkdir -p "${WEBHOOK_LOGS_DIR}"
+# Create and verify logs directory for polling logging
+mkdir -p "${POLLING_LOGS_DIR}"
 
 # Test log directory writability
-if ! touch "${WEBHOOK_LOGS_DIR}/.test_write" 2>/dev/null; then
-  echo "ERROR: Cannot write to logs directory: ${WEBHOOK_LOGS_DIR}" >&2
+if ! touch "${POLLING_LOGS_DIR}/.test_write" 2>/dev/null; then
+  echo "ERROR: Cannot write to logs directory: ${POLLING_LOGS_DIR}" >&2
   echo "Check directory permissions and disk space." >&2
   exit 2
 fi
-rm -f "${WEBHOOK_LOGS_DIR}/.test_write"
+rm -f "${POLLING_LOGS_DIR}/.test_write"
+
+# --- Set default environment variables ---
+# These will be used if not already set in environment or .env file
+
+# Core Jira settings
+export JIRA_BASE_URL="${JIRA_BASE_URL:-https://jira.telekom.de}"
+export JIRA_AUTH_MODE="${JIRA_AUTH_MODE:-bearer}"
+export JIRA_SOURCE="${JIRA_SOURCE:-auto}"
+
+# Polling configuration defaults
+export JIRA_POLLING_ENABLED="${JIRA_POLLING_ENABLED:-true}"
+export JIRA_POLLING_INTERVAL="${JIRA_POLLING_INTERVAL:-300}"
+export JIRA_POLLING_JQL="${JIRA_POLLING_JQL:-assignee = currentUser() ORDER BY updated DESC}"
+export JIRA_POLLING_MAX_RESULTS="${JIRA_POLLING_MAX_RESULTS:-50}"
+
+# Logging defaults
+export POLLING_LOG_LEVEL="${POLLING_LOG_LEVEL:-INFO}"
+export POLLING_LOG_FILE="${POLLING_LOG_FILE:-${POLLING_LOGS_DIR}/polling.log}"
+export AUTH_LOG_LEVEL="${AUTH_LOG_LEVEL:-INFO}"
+export AUTH_LOG_FILE="${AUTH_LOG_FILE:-${POLLING_LOGS_DIR}/auth.log}"
+export APP_LOG_LEVEL="${APP_LOG_LEVEL:-INFO}"
+export APP_LOG_FILE="${APP_LOG_FILE:-${POLLING_LOGS_DIR}/app.log}"
+export DEBUG_LOG_PATH="${DEBUG_LOG_PATH:-${POLLING_LOGS_DIR}/debug.log}"
+export DEBUG_SESSION_ID="${DEBUG_SESSION_ID:-polling-session}"
+
+# Default paths
+export REPO_ROOT="${REPO_ROOT:-${DEFAULT_REPO_DIR}}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUT_DIR}}"
+export LOGS_DIR="${LOGS_DIR:-${DEFAULT_LOGS_DIR}}"
 
 # --- Load .env automatically (same as Python's python-dotenv) ---
 if [[ -f "${PROJECT_ROOT}/.env" ]]; then
@@ -231,7 +272,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 echo ""
-echo "=== Jira Triage Webhook Setup ==="
+echo "=== Jira Polling Service Setup ==="
 echo ""
 
 # Helper: show status of each env var check
@@ -364,17 +405,15 @@ else
   echo "           -> using default: composer-2"
 fi
 
-# --- Webhook server settings ---
-webhook_host="${WEBHOOK_HOST:-0.0.0.0}"
-webhook_port="${WEBHOOK_PORT:-8080}"
-webhook_auto_attach="${WEBHOOK_AUTO_ATTACH:-false}"
-webhook_allow_open="${WEBHOOK_ALLOW_OPEN:-false}"
+# --- Polling settings ---
+polling_interval="${JIRA_POLLING_INTERVAL:-300}"
+polling_jql="${JIRA_POLLING_JQL:-assignee = currentUser() ORDER BY updated DESC}"
+polling_max_results="${JIRA_POLLING_MAX_RESULTS:-50}"
 
 echo ""
-printf "  %-26s %s\n" "WEBHOOK_HOST" "${webhook_host}"
-printf "  %-26s %s\n" "WEBHOOK_PORT" "${webhook_port}"
-printf "  %-26s %s\n" "WEBHOOK_AUTO_ATTACH" "${webhook_auto_attach}"
-printf "  %-26s %s\n" "WEBHOOK_ALLOW_OPEN" "${webhook_allow_open}"
+printf "  %-26s %s\n" "JIRA_POLLING_INTERVAL" "${polling_interval} seconds ($(( polling_interval / 60 )) minutes)"
+printf "  %-26s %s\n" "JIRA_POLLING_MAX_RESULTS" "${polling_max_results}"
+echo "  JIRA_POLLING_JQL: ${polling_jql}"
 
 echo ""
 
@@ -388,61 +427,59 @@ export JIRA_TOKEN="${pat}"
 export JIRA_PAT="${pat}"
 export REPO_ROOT="${repo_root}"
 export OUTPUT_DIR="${output_dir}"
-export WEBHOOK_HOST="${webhook_host}"
-export WEBHOOK_PORT="${webhook_port}"
-export WEBHOOK_AUTO_ATTACH="${webhook_auto_attach}"
-export WEBHOOK_ALLOW_OPEN="${webhook_allow_open}"
+export JIRA_POLLING_INTERVAL="${polling_interval}"
+export JIRA_POLLING_JQL="${polling_jql}"
+export JIRA_POLLING_MAX_RESULTS="${polling_max_results}"
 
 if [[ -n "${logs_dir:-}" ]]; then
   export LOGS_DIR="${logs_dir}"
 fi
 
 # --- Startup summary ---
-echo "=== Webhook server starting ==="
+echo "=== Jira Polling Service starting ==="
 echo ""
-echo "  Listening:          http://${webhook_host}:${webhook_port}/jira"
-echo "  Register in Jira:   use your machine's external IP or tunnel URL:"
-echo "                      e.g. https://<ngrok-id>.ngrok.io/jira"
+echo "  JQL Query:          ${polling_jql}"
+echo "  Poll Interval:      ${polling_interval} seconds ($(( polling_interval / 60 )) minutes)"
+echo "  Max Results:        ${polling_max_results} tickets per poll"
 echo ""
 echo "  Cursor analysis:    $([ -n "${CURSOR_API_KEY:-}" ] && echo "enabled (CURSOR_API_KEY set)" || echo "DISABLED (CURSOR_API_KEY not set)")"
-echo "  Auto-attach to Jira: ${webhook_auto_attach}"
 echo "  Output dir:         ${output_dir}"
 echo ""
 echo "  Log files:"
-echo "    Webhook requests:   ${PROJECT_ROOT}/logs/webhook.log"
-echo "    Authentication:     ${PROJECT_ROOT}/logs/auth.log"  
+echo "    Auth attempts:      ${PROJECT_ROOT}/logs/auth.log"
+echo "    Polling activity:   ${PROJECT_ROOT}/logs/polling.log"  
 echo "    Debug info:         ${PROJECT_ROOT}/logs/debug.log"
 echo ""
 echo "  Analysis files will appear at:"
 echo "    ${output_dir}/<TICKET-KEY>/cursor_analysis.txt"
 echo ""
 echo "  Real-time monitoring (run in another terminal):"
-echo "    ${0} monitor-webhook    # Monitor webhook requests"
+echo "    ${0} monitor-polling    # Monitor polling activity"
 echo "    ${0} monitor-auth       # Monitor authentication"
-echo "    ${0} monitor-polling    # Monitor polling service"
 echo "    ${0} monitor-all        # Monitor all logs"
 echo "    ${0} test-connectivity  # Test Jira connectivity"
+echo "    ${0} test-polling       # Test polling configuration"
 echo ""
-echo "  Alternative: Continuous Jira Polling (no admin required):"
-echo "    jira-cursor poll                    # Start continuous polling"
-echo "    jira-cursor poll --once --dry-run   # Test polling without processing"
-echo "    jira-cursor poll --interval 60      # Poll every minute"
-echo ""
-echo "Press Ctrl+C to stop the server."
+echo "Press Ctrl+C to stop the polling service."
 echo ""
 
 # --- Clean shutdown message ---
 _on_exit() {
   echo ""
-  echo "Webhook server stopped."
+  echo "Polling service stopped."
 }
 trap _on_exit EXIT
 
-# --- Start server (exec replaces shell so Ctrl+C goes directly to uvicorn) ---
-# Use module invocation (same pattern as setup_and_run.sh which uses python3 -m jira_triage.cli)
-# Falls back to installed entry point if available.
-if command -v jira-cursor-webhook >/dev/null 2>&1; then
-  exec jira-cursor-webhook --host "${webhook_host}" --port "${webhook_port}"
-else
-  exec python3 -m jira_triage.webhook --host "${webhook_host}" --port "${webhook_port}"
+# --- Check if virtual environment exists ---
+if [[ -d "${PROJECT_ROOT}/venv" ]]; then
+  echo "Activating virtual environment..."
+  source "${PROJECT_ROOT}/venv/bin/activate"
 fi
+
+# --- Start polling service ---
+echo "Starting continuous polling service..."
+echo "Command: jira-cursor poll --interval ${polling_interval}"
+echo ""
+
+# Use exec to replace shell so Ctrl+C goes directly to the polling service
+exec jira-cursor poll --interval "${polling_interval}"

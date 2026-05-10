@@ -11,9 +11,11 @@ from typing import Any, Sequence
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .config import ConfigError
+from .config import ConfigError, load_config
 from .core import TriageError, normalize_ticket_key, triage
-from .jira_client import JiraError
+from .debug_log import debug_log
+from .duplicate_detection import should_skip_processing
+from .jira_client import JiraError, fetch_issue
 from .logging_config import setup_webhook_logging
 
 # Initialize webhook logger
@@ -29,32 +31,21 @@ class WebhookLoggingMiddleware(BaseHTTPMiddleware):
         # Generate correlation ID
         correlation_id = str(uuid.uuid4())[:8]
         
-        # region agent log
-        try:
-            import json as _json
-            _log_entry = {
-                "sessionId": "1b4be1",
-                "id": f"log_{int(time.time() * 1000)}_middleware",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/webhook.py:32",
-                "message": "HTTP request received in middleware",
-                "data": {
-                    "correlation_id": correlation_id,
-                    "method": request.method,
-                    "path": str(request.url.path),
-                    "client_ip": request.client.host if request.client else "unknown",
-                    "user_agent": request.headers.get("user-agent", "unknown"),
-                    "content_length": request.headers.get("content-length", "unknown")
-                },
-                "runId": "debug",
-                "hypothesisId": "A"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
+        debug_log(
+            run_id="debug",
+            hypothesis_id="A",
+            location="jira_triage/webhook.py:WebhookLoggingMiddleware.dispatch",
+            message="HTTP request received in middleware",
+            data={
+                "correlation_id": correlation_id,
+                "method": request.method,
+                "path": str(request.url.path),
+                "client_ip": request.client.host if request.client else "unknown",
+                "user_agent": request.headers.get("user-agent", "unknown"),
+                "content_length": request.headers.get("content-length", "unknown"),
+            },
+        )
+
         # Log request start
         start_time = time.time()
         client_ip = request.client.host if request.client else "unknown"
@@ -146,55 +137,33 @@ async def jira_webhook(
     
     # Log payload processing start
     try:
-        # region agent log
-        try:
-            import json as _json
-            _log_entry = {
-                "sessionId": "1b4be1",
-                "id": f"log_{int(time.time() * 1000)}_payload",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/webhook.py:145",
-                "message": "Processing webhook payload",
-                "data": {
-                    "correlation_id": correlation_id,
-                    "payload_type": type(payload).__name__,
-                    "payload_is_dict": isinstance(payload, dict),
-                    "payload_keys": list(payload.keys()) if isinstance(payload, dict) else None,
-                    "has_issue": "issue" in payload if isinstance(payload, dict) else False
-                },
-                "runId": "debug",
-                "hypothesisId": "C,D"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
+        debug_log(
+            run_id="debug",
+            hypothesis_id="C,D",
+            location="jira_triage/webhook.py:jira_webhook",
+            message="Processing webhook payload",
+            data={
+                "correlation_id": correlation_id,
+                "payload_type": type(payload).__name__,
+                "payload_is_dict": isinstance(payload, dict),
+                "payload_keys": list(payload.keys()) if isinstance(payload, dict) else None,
+                "has_issue": "issue" in payload if isinstance(payload, dict) else False,
+            },
+        )
+
         ticket_key = _extract_ticket_key(payload)
-        
-        # region agent log
-        try:
-            import json as _json
-            _log_entry = {
-                "sessionId": "1b4be1",
-                "id": f"log_{int(time.time() * 1000)}_ticket_key",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/webhook.py:168",
-                "message": "Ticket key extracted",
-                "data": {
-                    "correlation_id": correlation_id,
-                    "ticket_key": ticket_key
-                },
-                "runId": "debug",
-                "hypothesisId": "C"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
+
+        debug_log(
+            run_id="debug",
+            hypothesis_id="C",
+            location="jira_triage/webhook.py:jira_webhook",
+            message="Ticket key extracted",
+            data={
+                "correlation_id": correlation_id,
+                "ticket_key": ticket_key,
+            },
+        )
+
         webhook_logger.info(
             "Processing payload: correlation_id=%s ticket_key=%s payload_type=%s",
             correlation_id, ticket_key, type(payload).__name__
@@ -225,31 +194,71 @@ async def jira_webhook(
             repo_requested or "default", logs_dir_requested or "default"
         )
         
-        # region agent log
-        try:
-            import json as _json
-            _log_entry = {
-                "sessionId": "1b4be1",
-                "id": f"log_{int(time.time() * 1000)}_triage_call",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/webhook.py:187",
-                "message": "About to call triage function",
-                "data": {
-                    "correlation_id": correlation_id,
-                    "ticket_key": ticket_key,
-                    "open_cursor": open_requested,
-                    "repo": repo_requested,
-                    "logs_dir": logs_dir_requested
-                },
-                "runId": "debug",
-                "hypothesisId": "D,E"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
+        # Check for duplicate processing before expensive triage operation
+        duplicate_check_start = time.time()
         
+        try:
+            # Load config for duplicate detection
+            config = load_config()
+            
+            # Fetch issue data for attachment checking
+            webhook_logger.debug("Fetching issue data for duplicate detection: correlation_id=%s ticket_key=%s", 
+                               correlation_id, ticket_key)
+            
+            issue_data = fetch_issue(config, ticket_key)
+            
+            # Check if we should skip processing
+            should_skip, skip_reason = should_skip_processing(
+                config=config,
+                ticket_key=ticket_key,
+                processing_mode="webhook",
+                issue_data=issue_data
+            )
+            
+            duplicate_check_duration = time.time() - duplicate_check_start
+            
+            if should_skip:
+                webhook_logger.info(
+                    "Skipping already processed ticket: correlation_id=%s ticket_key=%s reason='%s' check_duration=%.2fs",
+                    correlation_id, ticket_key, skip_reason, duplicate_check_duration
+                )
+                
+                return {
+                    "ticket_id": ticket_key,
+                    "status": "skipped",
+                    "reason": skip_reason,
+                    "correlation_id": correlation_id,
+                    "duplicate_check_duration": duplicate_check_duration,
+                    "message": f"Ticket {ticket_key} was already processed and skipped"
+                }
+            
+            webhook_logger.debug(
+                "Duplicate check passed: correlation_id=%s ticket_key=%s reason='%s' check_duration=%.2fs",
+                correlation_id, ticket_key, skip_reason, duplicate_check_duration
+            )
+            
+        except Exception as e:
+            duplicate_check_duration = time.time() - duplicate_check_start
+            webhook_logger.warning(
+                "Duplicate detection failed, proceeding with processing: correlation_id=%s ticket_key=%s error='%s' duration=%.2fs",
+                correlation_id, ticket_key, str(e), duplicate_check_duration
+            )
+            # Continue with processing on error (better to duplicate than miss)
+        
+        debug_log(
+            run_id="debug",
+            hypothesis_id="D,E",
+            location="jira_triage/webhook.py:jira_webhook",
+            message="About to call triage function",
+            data={
+                "correlation_id": correlation_id,
+                "ticket_key": ticket_key,
+                "open_cursor": open_requested,
+                "repo": repo_requested,
+                "logs_dir": logs_dir_requested,
+            },
+        )
+
         triage_start = time.time()
         result = triage(
             ticket_key,
@@ -263,31 +272,20 @@ async def jira_webhook(
         )
         triage_duration = time.time() - triage_start
         
-        # region agent log
-        try:
-            import json as _json
-            _log_entry = {
-                "sessionId": "1b4be1",
-                "id": f"log_{int(time.time() * 1000)}_triage_result",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/webhook.py:215",
-                "message": "Triage function completed",
-                "data": {
-                    "correlation_id": correlation_id,
-                    "ticket_key": ticket_key,
-                    "duration": triage_duration,
-                    "output_dir": str(result.output_dir),
-                    "output_dir_exists": result.output_dir.exists() if hasattr(result, 'output_dir') else False
-                },
-                "runId": "debug",
-                "hypothesisId": "D,E"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
+        debug_log(
+            run_id="debug",
+            hypothesis_id="D,E",
+            location="jira_triage/webhook.py:jira_webhook",
+            message="Triage function completed",
+            data={
+                "correlation_id": correlation_id,
+                "ticket_key": ticket_key,
+                "duration": triage_duration,
+                "output_dir": str(result.output_dir),
+                "output_dir_exists": result.output_dir.exists() if hasattr(result, "output_dir") else False,
+            },
+        )
+
         webhook_logger.info(
             "Triage completed: correlation_id=%s ticket_key=%s duration=%.3fs output_dir=%s",
             correlation_id, ticket_key, triage_duration, result.output_dir

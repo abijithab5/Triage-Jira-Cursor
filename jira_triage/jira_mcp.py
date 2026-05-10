@@ -59,7 +59,7 @@ def fetch_issue_via_mcp(config: Config, ticket_key: str) -> JiraMcpResult:
                     "arguments": {
                         "issue_key": ticket_key,
                         # Defaults on the server are good; keep this explicit for stability.
-                        "fields": "assignee,description,status,summary,updated,reporter,created,labels,priority,issuetype",
+                        "fields": "assignee,description,status,summary,updated,reporter,created,labels,priority,issuetype,attachment",
                         "comment_limit": 10,
                         "update_history": True,
                     },

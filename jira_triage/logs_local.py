@@ -7,7 +7,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .debug_log import debug_log
+# Embedded in placeholder text when LOGS_DIR has no ingestible files; summarized in logs_processing.
+NO_LOCAL_LOGS_STUB_MARKER = "NO LOG-LIKE FILES IN LOCAL LOG SOURCE"
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,41 @@ def _pick_source_dir(root: Path, ticket_key: str) -> Path:
     return root
 
 
+def _diagnostic_no_log_files(source: Path, ticket_key: str) -> str:
+    lines: list[str] = [
+        f"===== {NO_LOCAL_LOGS_STUB_MARKER} =====",
+        f"Ticket: {ticket_key}",
+        f"Resolved path: {source}",
+        "",
+        "LOGS_DIR exists but nothing matched ingest rules: typical extensions (.log, .txt, ",
+        ".json, .gz, ...) or rotated names (*.txt.0, ...), or extensionless filenames.",
+        "Names starting with '.' are ignored.",
+        "",
+    ]
+    if source.is_dir():
+        try:
+            entries = sorted(source.iterdir(), key=lambda p: p.name.lower())
+        except OSError as e:
+            lines.append(f"(Could not list directory: {e})")
+            return "\n".join(lines) + "\n"
+        visible = [p.name for p in entries if not p.name.startswith(".")]
+        hidden_ct = sum(1 for p in entries if p.name.startswith("."))
+        lines.append(f"Visible entries in this folder ({len(visible)}): {visible[:40]!r}")
+        if hidden_ct:
+            lines.append(
+                f"({hidden_ct} hidden dotfile(s) present; skipped for log ingest — e.g. .DS_Store)"
+            )
+        if not visible and hidden_ct:
+            lines.append("")
+            lines.append(
+                "Hint: drop router/device logs here or under "
+                f"{ticket_key}/ with a recognized extension."
+            )
+    else:
+        lines.append("(Source is not a directory; unexpected for empty scan.)")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _walk_files(root: Path) -> list[Path]:
     if root.is_file():
         return [root]
@@ -79,6 +115,27 @@ def _read_text(p: Path, *, max_bytes: int) -> str:
     return b.decode("utf-8", errors="replace")
 
 
+def has_ingestible_local_logs(logs_dir: Path, ticket_key: str) -> bool:
+    """
+    True if ``logs_dir`` resolves to an existing tree with at least one file that
+    passes ``_looks_like_log_file`` (same rules as ``collect_local_logs``).
+
+    Used to defer writing NO_LOCAL_LOGS placeholders until after optional Magnus
+    download when the folder is empty of real logs.
+    """
+    try:
+        root = logs_dir.expanduser().resolve()
+    except Exception:
+        root = Path(str(logs_dir)).expanduser()
+    if not root.exists():
+        return False
+    source = _pick_source_dir(root, ticket_key)
+    for p in _walk_files(source):
+        if p.is_file() and _looks_like_log_file(p):
+            return True
+    return False
+
+
 def collect_local_logs(
     *,
     ticket_dir: Path,
@@ -96,6 +153,8 @@ def collect_local_logs(
     - Select files that look like logs, prioritizing filenames containing the ticket key.
     - Copy selected files into `out/<KEY>/logs_local/` (truncating very large files).
     - Write a combined text file `out/<KEY>/logs.local.txt` for summarization.
+    - If the folder exists but has no ingestible files (e.g. only `.DS_Store`), writes a
+      diagnostic stub and still returns ``ok=True`` so triage can proceed.
     """
     try:
         logs_dir = logs_dir.expanduser().resolve()
@@ -108,7 +167,22 @@ def collect_local_logs(
     source = _pick_source_dir(logs_dir, ticket_key)
     candidates = [p for p in _walk_files(source) if p.is_file() and _looks_like_log_file(p)]
     if not candidates:
-        return LocalLogsResult(ok=False, source_dir=source, error=f"No log-like files found under: {source}")
+        # Degraded-success: folder exists but is empty of ingestible logs (common with
+        # only .DS_Store or misplaced paths). Produce a readable stub so triage/context
+        # continues without treating this as a hard "logs fetch failed" error chain.
+        dest_dir = (ticket_dir / "logs_local").resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        placeholder = dest_dir / "NO_LOCAL_LOGS_PLACEHOLDER.txt"
+        diag = _diagnostic_no_log_files(source, ticket_key)
+        placeholder.write_text(diag, encoding="utf-8")
+        combined_path = ticket_dir / "logs.local.txt"
+        combined_path.write_text(f"===== FILE: {placeholder} =====\n{diag}", encoding="utf-8")
+        return LocalLogsResult(
+            ok=True,
+            source_dir=source,
+            combined_path=combined_path,
+            copied_paths=[placeholder],
+        )
 
     tk = ticket_key.lower()
     tk_space = tk.replace("-", " ")
@@ -142,27 +216,6 @@ def collect_local_logs(
 
     candidates.sort(reverse=True, key=_priority)
     selected = candidates[:max_files]
-
-    # region agent log (no secrets)
-    try:
-        debug_log(
-            run_id="pre-fix",
-            hypothesis_id="H15",
-            location="jira_triage/logs_local.py:collect_local_logs",
-            message="Local logs selection summary",
-            data={
-                "ticket_key": ticket_key,
-                "source_dir": str(source),
-                "candidate_count": len(candidates),
-                "selected_count": len(selected),
-                "selected_names": [p.name for p in selected],
-                "selected_has_selfheal": any("selfheal" in p.name.lower() for p in selected),
-                "selected_has_messages": any(p.name.lower() == "messages" for p in selected),
-            },
-        )
-    except Exception:
-        pass
-    # endregion
 
     dest_dir = (ticket_dir / "logs_local").resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)

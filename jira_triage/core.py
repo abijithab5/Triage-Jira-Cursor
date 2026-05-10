@@ -12,16 +12,23 @@ from .context_builder import build_context_markdown, build_cursor_ticket_markdow
 from .cursor_analysis import CursorAnalysisError, run_cursor_analysis
 from .cursor_open import open_in_cursor
 from .debug_log import debug_log
-from .jira_attachments import upload_issue_attachment
-from .jira_client import JiraError, fetch_issue, preflight_myself
+from .duplicate_detection import mark_processing_complete
+from .jira_attachments import upload_issue_attachment, enhanced_upload_issue_attachment, generate_our_attachment_filename
+from .jira_client import (
+    JiraError,
+    degraded_preflight_myself_allows_issue_fetch,
+    fetch_issue,
+    preflight_myself,
+)
 from .jira_mcp import fetch_issue_via_mcp
 from .logs_client import fetch_logs
-from .logs_local import collect_local_logs
+from .logs_local import NO_LOCAL_LOGS_STUB_MARKER, collect_local_logs, has_ingestible_local_logs
 from .logs_processing import process_logs_file
+from .magnus_log_client import MagnusLogClient
 from .repo import RepoError, extract_keywords, resolve_repo_root, suggest_repo_paths
 
 
-TriageMode = Literal["manual", "webhook"]
+TriageMode = Literal["manual", "webhook", "polling"]
 
 _TICKET_RE = re.compile(r"([A-Z][A-Z0-9]+-\d+)", flags=re.IGNORECASE)
 
@@ -47,6 +54,7 @@ class TriageResult:
     issue_path: Path
     context_path: Path  # .cursor/context/TICKET.md
     bundle_context_path: Path  # out/<KEY>/context.md
+    logs_dir_path: Path | None = None
     logs_path: Path | None = None
     logs_cleaned_path: Path | None = None
     logs_summary_json_path: Path | None = None
@@ -71,6 +79,7 @@ class TriageResult:
         d["context_txt_path"] = str(self.context_txt_path) if self.context_txt_path else None
         d["bundle_context_path"] = str(self.bundle_context_path)
         d["bundle_context_txt_path"] = str(self.bundle_context_txt_path) if self.bundle_context_txt_path else None
+        d["logs_dir_path"] = str(self.logs_dir_path) if self.logs_dir_path else None
         d["logs_path"] = str(self.logs_path) if self.logs_path else None
         d["logs_cleaned_path"] = str(self.logs_cleaned_path) if self.logs_cleaned_path else None
         d["logs_summary_json_path"] = str(self.logs_summary_json_path) if self.logs_summary_json_path else None
@@ -130,39 +139,20 @@ def _analysis_autodraft(
     jira_base_url: str,
     issue: dict,
     jira_source_used: str | None,
-    logs_summary: dict | None,
-    logs_path: Path | None,
-    logs_cleaned_path: Path | None,
-    logs_summary_json_path: Path | None,
-    logs_summary_path: Path | None,
-    logs_summary_txt_path: Path | None,
+    logs_dir_path: Path | None,
     suggested_paths: list[dict[str, Any]] | None,
 ) -> str:
-    # region agent log
-    try:
-        import json as _json
-        import time
-        _log_entry = {
-            "sessionId": "7e4280",
-            "id": f"log_{int(time.time() * 1000)}_analysis_start",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:124",
-            "message": "Analysis autodraft started",
-            "data": {
-                "ticket_key": ticket_key,
-                "has_logs_summary": logs_summary is not None,
-                "logs_summary_keys": list(logs_summary.keys()) if isinstance(logs_summary, dict) else None,
-                "has_logs_path": logs_path is not None,
-                "has_suggested_paths": suggested_paths is not None and len(suggested_paths) > 0
-            },
-            "runId": "debug",
-            "hypothesisId": "H1,H3"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
+    debug_log(
+        run_id="debug",
+        hypothesis_id="H1,H3",
+        location="jira_triage/core.py:_analysis_autodraft",
+        message="Analysis autodraft started",
+        data={
+            "ticket_key": ticket_key,
+            "has_logs_dir": logs_dir_path is not None,
+            "has_suggested_paths": suggested_paths is not None and len(suggested_paths or []) > 0,
+        },
+    )
     link = f"{jira_base_url.rstrip('/')}/browse/{ticket_key}"
     fields = issue.get("fields") if isinstance(issue, dict) else {}
 
@@ -185,131 +175,22 @@ def _analysis_autodraft(
     lines.append("## Summary")
     lines.append("")
     lines.append("Auto-draft. Fill in the sections below with confirmed evidence and a concrete fix plan.")
-
-    signals = logs_summary.get("signals") if isinstance(logs_summary, dict) else None
-    if isinstance(signals, dict):
-        cpu = signals.get("cpu_usage_percent")
-        if isinstance(cpu, dict) and cpu.get("min") is not None and cpu.get("max") is not None:
-            lines.append(f"- Performance: CPU usage steady ({cpu.get('min')}–{cpu.get('max')}%).")
-
-        mem = signals.get("memory")
-        if isinstance(mem, dict):
-            ma = mem.get("mem_available_percent")
-            if ma is not None:
-                lines.append(f"- Memory: MemAvailable ~{ma}% (no OOM markers detected in scanned logs).")
-
-        root = signals.get("root_filesystem")
-        if isinstance(root, dict) and isinstance(root.get("use_percent"), int) and root.get("use_percent") >= 95:
-            lines.append(f"- Filesystem risk: root filesystem is {root.get('use_percent')}% used.")
-
-        sh = signals.get("selfheal_script_issues")
-        if isinstance(sh, dict) and sh.get("count"):
-            lines.append("- Selfheal: script/config issues present (see samples in logs summary).")
-
-        net = signals.get("network_health")
-        if isinstance(net, dict):
-            parts: list[str] = []
-            if net.get("brlan0_has_ip") is True:
-                parts.append("LAN brlan0 has IP")
-            if net.get("global_ipv6_present") is True:
-                parts.append("global IPv6 present")
-            if net.get("firewall_enabled") == 1:
-                parts.append("firewall enabled")
-            if parts:
-                lines.append(f"- Networking: {', '.join(parts)}.")
-
-    if isinstance(logs_summary, dict):
-        top_excs = logs_summary.get("top_exception_types") or []
-        if isinstance(top_excs, list) and top_excs:
-            names = []
-            for e in top_excs[:3]:
-                if isinstance(e, dict) and isinstance(e.get("name"), str):
-                    names.append(e["name"])
-            if names:
-                lines.append(f"- Top exceptions in logs: {', '.join(names)}")
-
     lines.append("")
 
     lines.append("## Evidence (logs + code pointers)")
     lines.append("")
     lines.append("- Bundle files (in this folder):")
     lines.append(f"  - Issue JSON: `issue.json`")
-    if logs_path is not None:
-        lines.append(f"  - Raw logs: `{logs_path.name}`")
-    if logs_cleaned_path is not None:
-        lines.append(f"  - Cleaned logs: `{logs_cleaned_path.name}`")
-    if logs_summary_path is not None:
-        lines.append(f"  - Logs summary (MD): `{logs_summary_path.name}`")
-    if logs_summary_txt_path is not None:
-        lines.append(f"  - Logs summary (TXT): `{logs_summary_txt_path.name}`")
-    if logs_summary_json_path is not None:
-        lines.append(f"  - Logs summary (JSON): `{logs_summary_json_path.name}`")
-    lines.append("")
     
-    # Add raw logs emphasis when processing is disabled
-    if logs_path is not None and not isinstance(logs_summary, dict):
-        lines.append("### Raw log analysis needed")
-        lines.append("")
-        lines.append(f"Log processing was disabled. Analyze raw logs directly: `{logs_path.name}`")
-        lines.append("Look for:")
-        lines.append("- Error messages and stack traces")
-        lines.append("- Performance indicators (CPU, memory usage)")
-        lines.append("- Request/response patterns")
-        lines.append("- Timing correlations with the reported issue")
-        lines.append("")
-
-    # region agent log
-    try:
-        import json as _json
-        import time
-        err_lines = logs_summary.get("sample_error_lines") or [] if isinstance(logs_summary, dict) else []
-        stack_hints = logs_summary.get("stack_hints") or [] if isinstance(logs_summary, dict) else []
-        _log_entry = {
-            "sessionId": "7e4280",
-            "id": f"log_{int(time.time() * 1000)}_log_analysis",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:288",
-            "message": "Log analysis data processing",
-            "data": {
-                "ticket_key": ticket_key,
-                "logs_summary_is_dict": isinstance(logs_summary, dict),
-                "error_lines_count": len(err_lines) if isinstance(err_lines, list) else 0,
-                "stack_hints_count": len(stack_hints) if isinstance(stack_hints, list) else 0,
-                "logs_summary_keys": list(logs_summary.keys()) if isinstance(logs_summary, dict) else None
-            },
-            "runId": "debug",
-            "hypothesisId": "H2,H3"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
-
-    if isinstance(logs_summary, dict):
-        err_lines = logs_summary.get("sample_error_lines") or []
-        if isinstance(err_lines, list) and err_lines:
-            lines.append("### Error samples")
-            lines.append("")
-            lines.append("```")
-            for ln in err_lines[:10]:
-                lines.append(str(ln))
-            lines.append("```")
-            lines.append("")
-
-        stack_hints = logs_summary.get("stack_hints") or []
-        if isinstance(stack_hints, list) and stack_hints:
-            lines.append("### Stack hints")
-            lines.append("")
-            for h in stack_hints[:10]:
-                if isinstance(h, dict):
-                    file = h.get("file") or h.get("symbol")
-                    line = h.get("line")
-                    if file and line:
-                        lines.append(f"- {file}:{line}")
-                    elif file:
-                        lines.append(f"- {file}")
-            lines.append("")
+    if logs_dir_path is not None and logs_dir_path.exists():
+        lines.append("  - Merged Logs (UTC timestamps converted to CET):")
+        for p in sorted(logs_dir_path.iterdir()):
+            if p.is_file() and not p.name.startswith(".") and p.suffix.lower() != ".json":
+                lines.append(f"    - `{p.name}`")
+        meta_summary = logs_dir_path / "metadata" / "merge_summary.txt"
+        if meta_summary.is_file():
+            lines.append("  - Merge statistics: `metadata/merge_summary.txt`")
+    lines.append("")
 
     if suggested_paths:
         lines.append("### Suggested repo paths to inspect")
@@ -352,6 +233,53 @@ def _analysis_autodraft(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _apply_local_logs_dir_fallback(
+    *,
+    ticket_dir: Path,
+    ticket_key: str,
+    logs_dir_path: Path,
+    logs_path: Path | None,
+    logs_error: str | None,
+) -> tuple[Path | None, str | None]:
+    """Run LOGS_DIR collection; on success set ``logs_path`` to combined local file."""
+    local_res = collect_local_logs(ticket_dir=ticket_dir, logs_dir=logs_dir_path, ticket_key=ticket_key)
+    debug_log(
+        run_id="debug",
+        hypothesis_id="H4",
+        location="jira_triage/core.py:triage",
+        message="Local logs collection result",
+        data={
+            "ticket_key": ticket_key,
+            "local_res_ok": local_res.ok,
+            "combined_path_exists": local_res.combined_path is not None,
+            "error": local_res.error,
+        },
+    )
+    if local_res.ok and local_res.combined_path is not None:
+        logs_path = local_res.combined_path
+        (ticket_dir / "logs.local.json").write_text(
+            json.dumps(
+                {
+                    "source_dir": str(local_res.source_dir) if local_res.source_dir else None,
+                    "combined_path": str(local_res.combined_path),
+                    "copied_paths": [str(p) for p in (local_res.copied_paths or [])],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    else:
+        local_err = local_res.error or "Local logs collection failed"
+        (ticket_dir / "logs.local.error.txt").write_text(local_err + "\n", encoding="utf-8")
+        if logs_error:
+            logs_error = f"{logs_error}; Local logs fallback failed: {local_err}"
+        else:
+            logs_error = f"Local logs fallback failed: {local_err}"
+    return logs_path, logs_error
+
+
 def _write_zip(bundle_dir: Path, *, extra_paths: list[tuple[Path, str]] | None = None) -> Path:
     zip_path = bundle_dir / "bundle.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -378,33 +306,25 @@ def triage(
     attach: bool = False,
     process_logs: bool = False,
     cursor_analysis: bool = False,
+    magnus_log_mac: str | None = None,
+    magnus_log_start_date: str | None = None,
+    magnus_log_end_date: str | None = None,
+    magnus_auto_merge_logs: bool | None = None,
 ) -> TriageResult:
     ticket_key = normalize_ticket_key(ticket_id_or_url)
 
-    # region agent log
-    try:
-        import json as _json
-        import time
-        _log_entry = {
-            "sessionId": "7e4280",
-            "id": f"log_{int(time.time() * 1000)}_triage_start",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:443",
-            "message": "Triage function started",
-            "data": {
-                "ticket_key": ticket_key,
-                "process_logs": process_logs,
-                "mode": mode,
-                "logs_dir_provided": logs_dir is not None
-            },
-            "runId": "implementation",
-            "hypothesisId": "H1,H2"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
+    debug_log(
+        run_id="implementation",
+        hypothesis_id="H1,H2",
+        location="jira_triage/core.py:triage",
+        message="Triage function started",
+        data={
+            "ticket_key": ticket_key,
+            "process_logs": process_logs,
+            "mode": mode,
+            "logs_dir_provided": logs_dir is not None,
+        },
+    )
 
     try:
         cfg = load_config()
@@ -422,57 +342,33 @@ def triage(
         out_base = (repo_root / out_base).resolve()
     ticket_dir = (out_base / ticket_key).resolve()
     
-    # region agent log
-    try:
-        import json as _json
-        import time
-        _log_entry = {
-            "sessionId": "1b4be1",
-            "id": f"log_{int(time.time() * 1000)}_output_dir",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:430",
-            "message": "Creating output directory",
-            "data": {
-                "ticket_key": ticket_key,
-                "out_base": str(out_base),
-                "ticket_dir": str(ticket_dir),
-                "ticket_dir_exists_before": ticket_dir.exists()
-            },
-            "runId": "debug",
-            "hypothesisId": "E"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
-    
+    debug_log(
+        run_id="debug",
+        hypothesis_id="E",
+        location="jira_triage/core.py:triage",
+        message="Creating output directory",
+        data={
+            "ticket_key": ticket_key,
+            "out_base": str(out_base),
+            "ticket_dir": str(ticket_dir),
+            "ticket_dir_exists_before": ticket_dir.exists(),
+        },
+    )
+
     ticket_dir.mkdir(parents=True, exist_ok=True)
-    
-    # region agent log
-    try:
-        import json as _json
-        import time
-        _log_entry = {
-            "sessionId": "1b4be1",
-            "id": f"log_{int(time.time() * 1000)}_dir_created",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:455",
-            "message": "Output directory creation attempted",
-            "data": {
-                "ticket_key": ticket_key,
-                "ticket_dir": str(ticket_dir),
-                "ticket_dir_exists_after": ticket_dir.exists(),
-                "ticket_dir_is_dir": ticket_dir.is_dir() if ticket_dir.exists() else False
-            },
-            "runId": "debug",
-            "hypothesisId": "E"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
+
+    debug_log(
+        run_id="debug",
+        hypothesis_id="E",
+        location="jira_triage/core.py:triage",
+        message="Output directory creation attempted",
+        data={
+            "ticket_key": ticket_key,
+            "ticket_dir": str(ticket_dir),
+            "ticket_dir_exists_after": ticket_dir.exists(),
+            "ticket_dir_is_dir": ticket_dir.is_dir() if ticket_dir.exists() else False,
+        },
+    )
 
     # 1) Jira fetch (REST primary; MCP fallback)
     issue: dict
@@ -485,31 +381,19 @@ def triage(
     if cfg.jira_source in {"auto", "api"}:
         api_attempted = True
         
-        # region agent log
-        try:
-            import json as _json
-            import time
-            _log_entry = {
-                "sessionId": "1b4be1",
-                "id": f"log_{int(time.time() * 1000)}_jira_auth_start",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/core.py:460",
-                "message": "Starting Jira API authentication",
-                "data": {
-                    "ticket_key": ticket_key,
-                    "jira_source": cfg.jira_source,
-                    "jira_base_url": cfg.jira_base_url,
-                    "jira_auth_mode": cfg.jira_auth_mode
-                },
-                "runId": "debug",
-                "hypothesisId": "B"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
+        debug_log(
+            run_id="debug",
+            hypothesis_id="B",
+            location="jira_triage/core.py:triage",
+            message="Starting Jira API authentication",
+            data={
+                "ticket_key": ticket_key,
+                "jira_source": cfg.jira_source,
+                "jira_base_url": cfg.jira_base_url,
+                "jira_auth_mode": cfg.jira_auth_mode,
+            },
+        )
+
         try:
             api_cfgs: list[Config] = [cfg]
             api_sources: list[str] = []
@@ -537,59 +421,87 @@ def triage(
                 )
 
                 myself_ok = isinstance(myself, dict) and myself.get("ok") is True and myself.get("status_code") == 200
-                if not myself_ok:
-                    # Only retry on 401 when we have another bearer candidate.
-                    if status == 401 and i + 1 < len(api_cfgs):
-                        continue
+                if myself_ok:
+                    try:
+                        issue = fetch_issue(cfg_try, ticket_key)
+                        jira_source_used = "api"
+                        cfg = cfg_try
+                        break
+                    except JiraError as e:
+                        if "(401" in str(e) and i + 1 < len(api_cfgs):
+                            continue
 
-                    login_reason = (myself or {}).get("x_seraph_loginreason") if isinstance(myself, dict) else None
-                    req_id = (myself or {}).get("x_arequestid") if isinstance(myself, dict) else None
+                        # region agent log
+                        debug_log(
+                            run_id="pre-fix",
+                            hypothesis_id="H18",
+                            location="jira_triage/core.py:triage",
+                            message="Jira REST issue fetch failed after preflight (attempt summary)",
+                            data={"ticket_key": ticket_key, "attempts": api_attempts, "error": str(e)},
+                        )
+                        # endregion
+                        raise
 
-                    hint = "Jira preflight failed: GET /myself did not return 200."
-                    if status == 401:
-                        hint = "Jira preflight failed (401): token not accepted for GET /myself."
-                    elif status == 403:
-                        hint = "Jira preflight failed (403): authenticated but not authorized for GET /myself."
+                # Only retry on 401 when we have another bearer candidate.
+                if status == 401 and i + 1 < len(api_cfgs):
+                    continue
 
-                    extra = []
-                    if login_reason:
-                        extra.append(f"loginReason={login_reason}")
-                    if req_id:
-                        extra.append(f"requestId={req_id}")
-                    extra_s = f" ({', '.join(extra)})" if extra else ""
+                # Degraded: /myself forbidden but session looks authenticated — try issue read anyway.
+                if isinstance(myself, dict) and degraded_preflight_myself_allows_issue_fetch(myself):
+                    try:
+                        issue = fetch_issue(cfg_try, ticket_key)
+                        jira_source_used = "api"
+                        cfg = cfg_try
+                        warn_path = ticket_dir / "jira_preflight.warning.txt"
+                        warn_path.write_text(
+                            "GET /rest/api/.../myself returned HTTP 403 (not permitted for this "
+                            "account/token), but GET issue/{key} succeeded. Jira triage will proceed "
+                            "using the REST API.\n",
+                            encoding="utf-8",
+                        )
+                        break
+                    except JiraError as fetch_err:
+                        api_attempts[-1]["issue_fetch_after_myself_403_error"] = str(fetch_err)
+                        login_reason = myself.get("x_seraph_loginreason")
+                        req_id = myself.get("x_arequestid")
+                        extra = []
+                        if login_reason:
+                            extra.append(f"loginReason={login_reason}")
+                        if req_id:
+                            extra.append(f"requestId={req_id}")
+                        extra_s = f" ({', '.join(extra)})" if extra else ""
+                        raise TriageError(
+                            f"Jira REST: GET /myself returned 403{extra_s} and issue fetch also failed: {fetch_err}. "
+                            f"See `{preflight_path}` for details."
+                        ) from fetch_err
 
-                    # region agent log
-                    debug_log(
-                        run_id="pre-fix",
-                        hypothesis_id="H18",
-                        location="jira_triage/core.py:triage",
-                        message="Jira REST preflight failed (attempt summary)",
-                        data={"ticket_key": ticket_key, "attempts": api_attempts},
-                    )
-                    # endregion
+                login_reason = (myself or {}).get("x_seraph_loginreason") if isinstance(myself, dict) else None
+                req_id = (myself or {}).get("x_arequestid") if isinstance(myself, dict) else None
 
-                    raise TriageError(f"{hint}{extra_s} See `{preflight_path}` for details.")
+                hint = "Jira preflight failed: GET /myself did not return 200."
+                if status == 401:
+                    hint = "Jira preflight failed (401): token not accepted for GET /myself."
+                elif status == 403:
+                    hint = "Jira preflight failed (403): authenticated but not authorized for GET /myself."
 
-                # Preflight ok; try issue fetch (may still 401 if edge case)
-                try:
-                    issue = fetch_issue(cfg_try, ticket_key)
-                    jira_source_used = "api"
-                    cfg = cfg_try
-                    break
-                except JiraError as e:
-                    if "(401" in str(e) and i + 1 < len(api_cfgs):
-                        continue
+                extra = []
+                if login_reason:
+                    extra.append(f"loginReason={login_reason}")
+                if req_id:
+                    extra.append(f"requestId={req_id}")
+                extra_s = f" ({', '.join(extra)})" if extra else ""
 
-                    # region agent log
-                    debug_log(
-                        run_id="pre-fix",
-                        hypothesis_id="H18",
-                        location="jira_triage/core.py:triage",
-                        message="Jira REST issue fetch failed after preflight (attempt summary)",
-                        data={"ticket_key": ticket_key, "attempts": api_attempts, "error": str(e)},
-                    )
-                    # endregion
-                    raise
+                # region agent log
+                debug_log(
+                    run_id="pre-fix",
+                    hypothesis_id="H18",
+                    location="jira_triage/core.py:triage",
+                    message="Jira REST preflight failed (attempt summary)",
+                    data={"ticket_key": ticket_key, "attempts": api_attempts},
+                )
+                # endregion
+
+                raise TriageError(f"{hint}{extra_s} See `{preflight_path}` for details.")
 
             if jira_source_used == "api":
                 # region agent log
@@ -602,31 +514,19 @@ def triage(
                 )
                 # endregion
         except (JiraError, TriageError) as e:
-            # region agent log
-            try:
-                import json as _json
-                import time
-                _log_entry = {
-                    "sessionId": "1b4be1",
-                    "id": f"log_{int(time.time() * 1000)}_jira_auth_error",
-                    "timestamp": int(time.time() * 1000),
-                    "location": "jira_triage/core.py:560",
-                    "message": "Jira API authentication/fetch failed",
-                    "data": {
-                        "ticket_key": ticket_key,
-                        "error_type": type(e).__name__,
-                        "error_message": str(e)[:500],  # Truncate long errors
-                        "jira_source": cfg.jira_source
-                    },
-                    "runId": "debug",
-                    "hypothesisId": "B"
-                }
-                with open("/Users/abijithp/Desktop/Jira-triage/.cursor/debug-1b4be1.log", "a", encoding="utf-8") as _f:
-                    _f.write(_json.dumps(_log_entry) + "\n")
-            except Exception:
-                pass
-            # endregion
-            
+            debug_log(
+                run_id="debug",
+                hypothesis_id="B",
+                location="jira_triage/core.py:triage",
+                message="Jira API authentication/fetch failed",
+                data={
+                    "ticket_key": ticket_key,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)[:500],
+                    "jira_source": cfg.jira_source,
+                },
+            )
+
             jira_errors["api"] = str(e)
             (ticket_dir / "jira_api.error.txt").write_text(str(e) + "\n", encoding="utf-8")
             if cfg.jira_source == "api":
@@ -712,222 +612,130 @@ def triage(
     elif cfg.logs_dir is not None:
         logs_dir_path = cfg.logs_dir
 
-    # region agent log
-    try:
-        import json as _json
-        import time
-        _log_entry = {
-            "sessionId": "7e4280",
-            "id": f"log_{int(time.time() * 1000)}_local_logs_attempt",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:565",
-            "message": "Local logs collection attempt",
-            "data": {
-                "ticket_key": ticket_key,
-                "logs_path_is_none": logs_path is None,
-                "logs_dir_path_provided": logs_dir_path is not None,
-                "logs_dir_path": str(logs_dir_path) if logs_dir_path else None
-            },
-            "runId": "debug",
-            "hypothesisId": "H4"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
+    has_local_ingest = (
+        has_ingestible_local_logs(logs_dir_path, ticket_key) if logs_dir_path is not None else False
+    )
+    debug_log(
+        run_id="debug",
+        hypothesis_id="H4",
+        location="jira_triage/core.py:triage",
+        message="Local logs collection attempt (when ingestible files exist)",
+        data={
+            "ticket_key": ticket_key,
+            "logs_path_is_none": logs_path is None,
+            "logs_dir_path_provided": logs_dir_path is not None,
+            "logs_dir_path": str(logs_dir_path) if logs_dir_path else None,
+            "has_ingestible_local": has_local_ingest,
+        },
+    )
 
-    if logs_path is None and logs_dir_path is not None:
-        local_res = collect_local_logs(ticket_dir=ticket_dir, logs_dir=logs_dir_path, ticket_key=ticket_key)
-        
-        # region agent log
+    if logs_path is None and logs_dir_path is not None and has_local_ingest:
+        logs_path, logs_error = _apply_local_logs_dir_fallback(
+            ticket_dir=ticket_dir,
+            ticket_key=ticket_key,
+            logs_dir_path=logs_dir_path,
+            logs_path=logs_path,
+            logs_error=logs_error,
+        )
+
+    # 2.5) Magnus API logs fetch (optional, non-fatal)
+    magnus_stats = None
+    if cfg.magnus_log_api_enabled:
         try:
-            import json as _json
-            import time
-            _log_entry = {
-                "sessionId": "7e4280",
-                "id": f"log_{int(time.time() * 1000)}_local_logs_result",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/core.py:570",
-                "message": "Local logs collection result",
-                "data": {
-                    "ticket_key": ticket_key,
-                    "local_res_ok": local_res.ok if hasattr(local_res, 'ok') else None,
-                    "combined_path_exists": local_res.combined_path is not None if hasattr(local_res, 'combined_path') else None,
-                    "error": local_res.error if hasattr(local_res, 'error') else None
-                },
-                "runId": "debug",
-                "hypothesisId": "H4"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
-        if local_res.ok and local_res.combined_path is not None:
-            logs_path = local_res.combined_path
-            (ticket_dir / "logs.local.json").write_text(
-                json.dumps(
-                    {
-                        "source_dir": str(local_res.source_dir) if local_res.source_dir else None,
-                        "combined_path": str(local_res.combined_path),
-                        "copied_paths": [str(p) for p in (local_res.copied_paths or [])],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+            from datetime import datetime
+            
+            client = MagnusLogClient(cfg)
+            description = issue.get("fields", {}).get("description") if isinstance(issue, dict) else None
+            
+            # Parse dates from CLI parameters if provided
+            start_date = None
+            end_date = None
+            if magnus_log_start_date:
+                try:
+                    start_date = datetime.fromisoformat(magnus_log_start_date.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            if magnus_log_end_date:
+                try:
+                    end_date = datetime.fromisoformat(magnus_log_end_date.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            
+            magnus_stats = client.download_logs(
+                ticket_key=ticket_key,
+                mac_address=magnus_log_mac,  # Will use CLI override, config, or extract from description
+                start_date=start_date,       # Will use CLI override or extract from description
+                end_date=end_date,           # Will use CLI override or extract from description
+                output_dir=ticket_dir / "logs" / "magnus",
+                description=description,
+                issue_data=issue,
+                auto_merge_logs=magnus_auto_merge_logs if magnus_auto_merge_logs is not None else getattr(cfg, "magnus_auto_merge_logs", True),
             )
-        else:
-            local_err = local_res.error or "Local logs collection failed"
-            (ticket_dir / "logs.local.error.txt").write_text(local_err + "\n", encoding="utf-8")
-            if logs_error:
-                logs_error = f"{logs_error}; Local logs fallback failed: {local_err}"
+            
+            if not magnus_stats.success:
+                print(f"⚠️  Magnus log download failed: {magnus_stats.error}")
             else:
-                logs_error = f"Local logs fallback failed: {local_err}"
+                print(f"✅ Magnus logs downloaded successfully ({magnus_stats.logs_downloaded} files)")
+                
+                # Point logs_dir_path to the merged directory and skip single log picking
+                if getattr(magnus_stats, "merged_dir", None) and magnus_stats.merged_dir:
+                    logs_dir_path = magnus_stats.merged_dir
+                    # Since we are keeping raw merged data, we don't pick a single critical log
+                    logs_path = None
+                    
+        except Exception as e:
+            print(f"❌ Error downloading Magnus logs: {e}")
 
-    # 3) Clean + structure logs (optional, only if process_logs=True)
+    debug_log(
+        run_id="debug",
+        hypothesis_id="H4",
+        location="jira_triage/core.py:triage",
+        message="Local logs fallback after Magnus (placeholder or error)",
+        data={
+            "ticket_key": ticket_key,
+            "logs_path_is_none": logs_path is None,
+            "logs_dir_path": str(logs_dir_path) if logs_dir_path else None,
+        },
+    )
+    if logs_path is None and logs_dir_path is not None and not cfg.magnus_log_api_enabled:
+        # Only fallback to local if Magnus was not enabled or didn't set a merged_dir
+        logs_path, logs_error = _apply_local_logs_dir_fallback(
+            ticket_dir=ticket_dir,
+            ticket_key=ticket_key,
+            logs_dir_path=logs_dir_path,
+            logs_path=logs_path,
+            logs_error=logs_error,
+        )
+
+    if logs_path is not None and logs_path.is_file():
+        try:
+            _preview = logs_path.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            _preview = ""
+        if NO_LOCAL_LOGS_STUB_MARKER in _preview:
+            print(
+                "ℹ️  LOGS_DIR had no ingestible log files (empty tree, dotfiles only, or unsupported "
+                f"names). See {ticket_dir / 'logs_local' / 'NO_LOCAL_LOGS_PLACEHOLDER.txt'} — add "
+                "`.log`/`.txt` under LOGS_DIR/<KEY>/ or enable Magnus."
+            )
+
+    # 3) Skip Clean + structure logs
     logs_cleaned_path: Path | None = None
     logs_summary_json_path: Path | None = None
     logs_summary_path: Path | None = None
     logs_summary_txt_path: Path | None = None
     logs_summary: dict | None = None
     
-    # region agent log
-    try:
-        import json as _json
-        import time
-        _log_entry = {
-            "sessionId": "7e4280",
-            "id": f"log_{int(time.time() * 1000)}_log_processing_decision",
-            "timestamp": int(time.time() * 1000),
-            "location": "jira_triage/core.py:745",
-            "message": "Log processing decision point",
-            "data": {
-                "ticket_key": ticket_key,
-                "process_logs": process_logs,
-                "logs_path_available": logs_path is not None,
-                "will_process": process_logs and logs_path is not None
-            },
-            "runId": "implementation",
-            "hypothesisId": "H2"
-        }
-        with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(_log_entry) + "\n")
-    except Exception:
-        pass
-    # endregion
-    
-    if logs_path is not None and process_logs:
-        # region agent log
-        try:
-            import json as _json
-            import time
-            _log_entry = {
-                "sessionId": "7e4280",
-                "id": f"log_{int(time.time() * 1000)}_process_logs_attempt",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/core.py:760",
-                "message": "Log processing attempt",
-                "data": {
-                    "ticket_key": ticket_key,
-                    "logs_path": str(logs_path),
-                    "logs_path_exists": logs_path.exists() if logs_path else False
-                },
-                "runId": "implementation",
-                "hypothesisId": "H2"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
-        
-        try:
-            artifacts = process_logs_file(ticket_dir=ticket_dir, raw_path=logs_path)
-            logs_cleaned_path = artifacts.cleaned_path
-            logs_summary_json_path = artifacts.summary_json_path
-            logs_summary_path = artifacts.summary_md_path
-            logs_summary_txt_candidate = (ticket_dir / "logs.summary.txt").resolve()
-            if logs_summary_txt_candidate.is_file():
-                logs_summary_txt_path = logs_summary_txt_candidate
-            logs_summary = artifacts.summary
-            
-            # region agent log
-            try:
-                import json as _json
-                import time
-                _log_entry = {
-                    "sessionId": "7e4280",
-                    "id": f"log_{int(time.time() * 1000)}_process_logs_success",
-                    "timestamp": int(time.time() * 1000),
-                    "location": "jira_triage/core.py:780",
-                    "message": "Log processing successful",
-                    "data": {
-                        "ticket_key": ticket_key,
-                        "has_summary": logs_summary is not None,
-                        "summary_keys": list(logs_summary.keys()) if isinstance(logs_summary, dict) else None,
-                        "summary_size": len(str(logs_summary)) if logs_summary else 0
-                    },
-                    "runId": "implementation",
-                    "hypothesisId": "H2"
-                }
-                with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-                    _f.write(_json.dumps(_log_entry) + "\n")
-            except Exception:
-                pass
-            # endregion
-            
-        except Exception as e:
-            # region agent log
-            try:
-                import json as _json
-                import time
-                _log_entry = {
-                    "sessionId": "7e4280",
-                    "id": f"log_{int(time.time() * 1000)}_process_logs_error",
-                    "timestamp": int(time.time() * 1000),
-                    "location": "jira_triage/core.py:800",
-                    "message": "Log processing failed",
-                    "data": {
-                        "ticket_key": ticket_key,
-                        "error": str(e),
-                        "error_type": type(e).__name__
-                    },
-                    "runId": "implementation",
-                    "hypothesisId": "H2"
-                }
-                with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-                    _f.write(_json.dumps(_log_entry) + "\n")
-            except Exception:
-                pass
-            # endregion
-            (ticket_dir / "logs.process.error.txt").write_text(str(e) + "\n", encoding="utf-8")
-    else:
-        # region agent log
-        try:
-            import json as _json
-            import time
-            _log_entry = {
-                "sessionId": "7e4280",
-                "id": f"log_{int(time.time() * 1000)}_skip_log_processing",
-                "timestamp": int(time.time() * 1000),
-                "location": "jira_triage/core.py:815",
-                "message": "Skipping log processing - using raw logs only",
-                "data": {
-                    "ticket_key": ticket_key,
-                    "reason": "process_logs=False" if not process_logs else "no logs_path"
-                },
-                "runId": "implementation",
-                "hypothesisId": "H2"
-            }
-            with open("/Users/abijithp/Desktop/Jira-triage/jira_triage/.cursor/debug-7e4280.log", "a", encoding="utf-8") as _f:
-                _f.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # endregion
+    debug_log(
+        run_id="implementation",
+        hypothesis_id="H2",
+        location="jira_triage/core.py:triage",
+        message="Skipping log processing - using raw logs only",
+        data={
+            "ticket_key": ticket_key,
+            "reason": "Log processing removed per requirements",
+        },
+    )
 
     # 4) Select repo paths (heuristic)
     fields = issue.get("fields") if isinstance(issue, dict) else {}
@@ -936,19 +744,6 @@ def triage(
     desc_text = issue_desc if isinstance(issue_desc, str) else json.dumps(issue_desc, ensure_ascii=False)[:20_000]
 
     extra_kw_texts: list[str] = []
-    if isinstance(logs_summary, dict):
-        for e in logs_summary.get("top_exception_types") or []:
-            if isinstance(e, dict) and isinstance(e.get("name"), str):
-                extra_kw_texts.append(e["name"])
-        for h in logs_summary.get("http_calls") or []:
-            if isinstance(h, dict) and isinstance(h.get("target"), str):
-                extra_kw_texts.append(h["target"])
-        for h in logs_summary.get("stack_hints") or []:
-            if isinstance(h, dict):
-                for k in ("file", "symbol"):
-                    v = h.get(k)
-                    if isinstance(v, str):
-                        extra_kw_texts.append(v)
 
     keywords = extract_keywords(
         [
@@ -1014,12 +809,7 @@ def triage(
             jira_base_url=cfg.jira_base_url,
             issue=issue,
             jira_source_used=jira_source_used,
-            logs_summary=logs_summary,
-            logs_path=logs_path,
-            logs_cleaned_path=logs_cleaned_path,
-            logs_summary_json_path=logs_summary_json_path,
-            logs_summary_path=logs_summary_path,
-            logs_summary_txt_path=logs_summary_txt_path,
+            logs_dir_path=logs_dir_path,
             suggested_paths=suggested_paths_payload,
         )
 
@@ -1208,8 +998,10 @@ def triage(
     # endregion
 
     # 9) Optional: zip + attach to Jira
-    # In webhook mode, attach is gated by WEBHOOK_AUTO_ATTACH env var (same pattern as open_cursor).
-    should_attach = attach and (mode == "manual" or cfg.webhook_auto_attach)
+    # In webhook mode, attach is gated by WEBHOOK_AUTO_ATTACH env var.
+    # In polling mode, always attach when attach=True.
+    # In manual mode, always attach when attach=True.
+    should_attach = attach and (mode == "manual" or mode == "polling" or cfg.webhook_auto_attach)
     bundle_zip_path: Path | None = None
     if should_attach:
         try:
@@ -1223,25 +1015,80 @@ def triage(
             raise TriageError(f"Failed to create bundle zip: {e}") from e
 
         try:
-            upload = upload_issue_attachment(cfg, ticket_key, bundle_zip_path)
+            # Use enhanced upload with consistent filename for our analysis bundles
+            attachment_filename = generate_our_attachment_filename(ticket_key)
+            upload = enhanced_upload_issue_attachment(cfg, ticket_key, bundle_zip_path, 
+                                                   custom_filename=attachment_filename)
         except JiraError as e:
             raise TriageError(str(e)) from e
+        
+        # Save upload result
+        upload_result = {
+            "ok": upload.ok,
+            "status_code": upload.status_code,
+            "error": upload.error,
+            "response": upload.response_json,
+            "attachment_filename": attachment_filename,
+        }
+        
         (ticket_dir / "jira_attachment_upload.json").write_text(
-            json.dumps(
-                {
-                    "ok": upload.ok,
-                    "status_code": upload.status_code,
-                    "error": upload.error,
-                    "response": upload.response_json,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
+            json.dumps(upload_result, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        
         if not upload.ok:
             raise TriageError(upload.error or "Attachment upload failed")
+        
+        # Mark ticket as processed in our database after successful upload
+        try:
+            # Extract attachment ID from upload response
+            attachment_id = None
+            if upload.response_json and isinstance(upload.response_json, list) and len(upload.response_json) > 0:
+                attachment_id = str(upload.response_json[0].get("id", ""))
+            elif upload.response_json and isinstance(upload.response_json, dict):
+                attachment_id = str(upload.response_json.get("id", ""))
+            
+            # Get analysis content for change detection (from analysis file if it exists)
+            analysis_content = None
+            analysis_md_path = ticket_dir / "analysis.md"
+            if analysis_md_path.exists():
+                analysis_content = analysis_md_path.read_text(encoding="utf-8", errors="ignore")
+            
+            mark_processing_complete(
+                config=cfg,
+                ticket_key=ticket_key,
+                processing_mode=mode,
+                jira_attachment_id=attachment_id,
+                attachment_filename=attachment_filename,
+                analysis_content=analysis_content
+            )
+            
+            debug_log(
+                run_id="debug",
+                hypothesis_id="H1",
+                location="jira_triage/core.py:triage",
+                message="processing_marked_complete",
+                data={
+                    "ticket_key": ticket_key,
+                    "mode": mode,
+                    "attachment_id": attachment_id,
+                    "attachment_filename": attachment_filename
+                }
+            )
+            
+        except Exception as e:
+            # Log but don't fail the entire process
+            debug_log(
+                run_id="debug",
+                hypothesis_id="H1",
+                location="jira_triage/core.py:triage",
+                message="processing_complete_marking_failed",
+                data={
+                    "ticket_key": ticket_key,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            )
 
     # 10) Cursor open (manual by default; webhook gated by WEBHOOK_ALLOW_OPEN)
     should_open = False
@@ -1290,6 +1137,7 @@ def triage(
         issue_path=issue_path,
         context_path=cursor_context_path,
         bundle_context_path=bundle_context_path,
+        logs_dir_path=logs_dir_path,
         logs_path=logs_path,
         logs_cleaned_path=logs_cleaned_path,
         logs_summary_json_path=logs_summary_json_path,

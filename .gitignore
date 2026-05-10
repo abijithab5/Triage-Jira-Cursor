@@ -14,3 +14,10 @@ Triage-Jira-Cursor/
 logs/
 *.egg-info/
 venv/
+data/
+test_logs_input/
+test_logs_output/
+
+# Personal secret env (never commit)
+jira_triage/set_env_abijith.sh
+jira_triage/.magnus_token.local

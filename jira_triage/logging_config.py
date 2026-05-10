@@ -106,12 +106,26 @@ def setup_general_logging() -> logging.Logger:
     )
 
 
+def setup_polling_logging() -> logging.Logger:
+    """Set up polling service logging."""
+    level = get_log_level("POLLING_LOG_LEVEL", "INFO")
+    log_file = get_log_path("POLLING_LOG_FILE", "polling.log")
+    
+    return setup_logger(
+        "jira_triage.polling",
+        log_file,
+        level,
+        "%(asctime)s - POLLING - %(levelname)s - %(message)s",
+    )
+
+
 def configure_all_logging() -> dict[str, logging.Logger]:
     """Configure all loggers and return them."""
     return {
         "webhook": setup_webhook_logging(),
         "auth": setup_auth_logging(), 
         "app": setup_general_logging(),
+        "polling": setup_polling_logging(),
     }
 
 
